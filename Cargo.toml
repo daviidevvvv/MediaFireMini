@@ -1,0 +1,18 @@
+[package]
+name = "mediafire_mini"
+version = "0.2.0"
+edition = "2021"
+description = "Minimal native Windows GUI for MediaFire folder downloads via MDRS"
+
+[dependencies]
+nwg = { package = "native-windows-gui", version = "=1.0.13", features = ["notice", "file-dialog", "progress-bar"] }
+zip = { version = "=2.4.2", default-features = false, features = ["deflate"] }
+ureq = { version = "=2.12.1", default-features = false, features = ["tls", "json"] }
+serde = { version = "1.0", features = ["derive"] }
+sha2 = "0.10"
+
+[profile.release]
+opt-level = "s"
+lto = "thin"
+codegen-units = 1
+strip = true

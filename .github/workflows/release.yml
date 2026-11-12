@@ -1,0 +1,31 @@
+name: Release Windows
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Test
+        run: cargo test --all-targets --locked
+      - name: Build
+        run: cargo build --release --bins --locked
+      - name: Prepare assets
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Copy-Item target\release\mediafire_mini.exe dist\MediaFireMini.exe
+          Copy-Item target\release\mediafire_mini_updater.exe dist\MediaFireMiniUpdater.exe
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: pwsh
+        run: gh release create "$env:GITHUB_REF_NAME" "dist\MediaFireMini.exe" "dist\MediaFireMiniUpdater.exe" --generate-notes
