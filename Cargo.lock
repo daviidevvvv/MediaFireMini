@@ -2830,12 +2830,13 @@ dependencies = [
 
 [[package]]
 name = "mediafire_mini"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "arboard",
  "md_downloader",
  "reqwest",
  "rfd",
+ "ring",
  "serde",
  "serde_json",
  "slint",

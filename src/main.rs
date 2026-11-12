@@ -11,7 +11,7 @@ use std::{
     sync::{Arc, Mutex},
     thread,
 };
-use update_check::{EngineCheckResult, EMBEDDED_ENGINE_VERSION, RELEASES_PAGE_URL};
+use update_check::{AppUpdate, CheckResult, EMBEDDED_ENGINE_VERSION, RELEASES_PAGE_URL};
 
 slint::include_modules!();
 
@@ -32,9 +32,11 @@ struct ScannedCache {
 struct AppState {
     running: bool,
     checking_engine: bool,
+    updating_app: bool,
     cancel: Option<CancelToken>,
     last_folder: Option<PathBuf>,
     engine_release_url: String,
+    available_app_update: Option<AppUpdate>,
     scanned: Option<ScannedCache>,
 }
 
@@ -43,9 +45,11 @@ impl Default for AppState {
         Self {
             running: false,
             checking_engine: false,
+            updating_app: false,
             cancel: None,
             last_folder: None,
             engine_release_url: RELEASES_PAGE_URL.to_owned(),
+            available_app_update: None,
             scanned: None,
         }
     }
@@ -153,7 +157,7 @@ fn invalidate_selection_if_url_changed(
 
 fn spawn_engine_check(ui_weak: slint::Weak<AppWindow>, state: Arc<Mutex<AppState>>) {
     if let Ok(mut guard) = state.lock() {
-        if guard.checking_engine {
+        if guard.checking_engine || guard.updating_app {
             return;
         }
         guard.checking_engine = true;
@@ -161,44 +165,76 @@ fn spawn_engine_check(ui_weak: slint::Weak<AppWindow>, state: Arc<Mutex<AppState
     if let Some(ui) = ui_weak.upgrade() {
         ui.set_is_checking_engine(true);
         ui.set_engine_status_text(SharedString::from(format!(
-            "Motore v{EMBEDDED_ENGINE_VERSION} · Controllo mediafire_rs su GitHub..."
+            "Motore v{EMBEDDED_ENGINE_VERSION} · Controllo aggiornamenti su GitHub..."
         )));
     }
 
     thread::spawn(move || {
-        let result = update_check::check_latest_engine();
+        let result = update_check::check_updates();
         let _ = slint::invoke_from_event_loop(move || {
             if let Ok(mut guard) = state.lock() {
                 guard.checking_engine = false;
-                if let EngineCheckResult::UpdateAvailable { ref url, .. } = result {
-                    guard.engine_release_url = url.clone();
+                match &result {
+                    CheckResult::AppUpdateAvailable { update, .. } => {
+                        guard.available_app_update = Some(update.clone());
+                    }
+                    CheckResult::UpstreamEngineNotice { url, .. } => {
+                        guard.available_app_update = None;
+                        guard.engine_release_url = url.clone();
+                    }
+                    _ => {
+                        guard.available_app_update = None;
+                    }
                 }
             }
             let Some(ui) = ui_weak.upgrade() else { return };
             ui.set_is_checking_engine(false);
             match result {
-                EngineCheckResult::UpToDate { installed } => {
+                CheckResult::AppUpdateAvailable {
+                    current_app,
+                    update,
+                } => {
+                    ui.set_app_update_available(true);
+                    ui.set_engine_update_available(false);
+                    ui.set_engine_update_banner(SharedString::from(format!(
+                        "Nuova versione {} disponibile (attuale v{current_app}). Aggiorna con un clic senza creare cartelle.",
+                        update.version
+                    )));
+                    ui.set_engine_status_text(SharedString::from(format!(
+                        "Aggiornamento disponibile: {} (attuale v{current_app})",
+                        update.version
+                    )));
+                }
+                CheckResult::UpstreamEngineNotice {
+                    installed_engine,
+                    latest_engine,
+                    ..
+                } => {
+                    ui.set_app_update_available(false);
+                    ui.set_engine_update_available(true);
+                    ui.set_engine_update_banner(SharedString::from(format!(
+                        "Nuova release upstream mediafire_rs {latest_engine} disponibile (motore integrato: v{installed_engine})."
+                    )));
+                    ui.set_engine_status_text(SharedString::from(format!(
+                        "Motore integrato v{installed_engine} · Upstream {latest_engine} disponibile"
+                    )));
+                }
+                CheckResult::UpToDate {
+                    app_version,
+                    engine_version,
+                } => {
+                    ui.set_app_update_available(false);
                     ui.set_engine_update_available(false);
                     ui.set_engine_update_banner(SharedString::default());
                     ui.set_engine_status_text(SharedString::from(format!(
-                        "Motore integrato v{installed} · Aggiornato (NicKoehler/mediafire_rs)"
+                        "v{app_version} · Motore v{engine_version} · Tutto aggiornato"
                     )));
                 }
-                EngineCheckResult::UpdateAvailable {
-                    installed, latest, ..
-                } => {
-                    ui.set_engine_update_available(true);
-                    ui.set_engine_update_banner(SharedString::from(format!(
-                        "Nuova release mediafire_rs {latest} disponibile su GitHub (motore integrato: v{installed})."
-                    )));
-                    ui.set_engine_status_text(SharedString::from(format!(
-                        "Motore integrato v{installed} · Disponibile {latest} su GitHub"
-                    )));
-                }
-                EngineCheckResult::Error(err) => {
+                CheckResult::Error(err) => {
+                    ui.set_app_update_available(false);
                     ui.set_engine_update_available(false);
                     ui.set_engine_status_text(SharedString::from(format!(
-                        "Motore integrato v{EMBEDDED_ENGINE_VERSION} · Verifica GitHub non riuscita ({err})"
+                        "Motore v{EMBEDDED_ENGINE_VERSION} · Verifica GitHub non riuscita ({err})"
                     )));
                 }
             }
@@ -227,6 +263,70 @@ fn main() -> Result<(), slint::PlatformError> {
         let state = state.clone();
         ui.on_check_engine_updates(move || {
             spawn_engine_check(ui_weak.clone(), state.clone());
+        });
+    }
+
+    // One-click single-EXE self-update
+    {
+        let ui_weak = ui.as_weak();
+        let state = state.clone();
+        ui.on_apply_app_update(move || {
+            let Some(ui) = ui_weak.upgrade() else { return };
+            let update_opt = {
+                let Ok(mut guard) = state.lock() else { return };
+                if guard.running || guard.updating_app {
+                    return;
+                }
+                let Some(upd) = guard.available_app_update.clone() else {
+                    return;
+                };
+                guard.updating_app = true;
+                upd
+            };
+
+            ui.set_is_updating_app(true);
+            ui.set_is_indeterminate(true);
+            ui.set_banner_error(SharedString::default());
+            ui.set_status_title(SharedString::from(format!(
+                "Aggiornamento a {} in corso...",
+                update_opt.version
+            )));
+            ui.set_status_detail(SharedString::from(
+                "Scarico MediaFireMini.exe e verifico SHA256...",
+            ));
+            ui.set_progress_summary(SharedString::default());
+
+            let ui_thread_weak = ui.as_weak();
+            let state_thread = state.clone();
+            thread::spawn(move || {
+                let res = update_check::download_and_launch_self_update(&update_opt);
+                let _ = slint::invoke_from_event_loop(move || {
+                    if let Ok(mut guard) = state_thread.lock() {
+                        guard.updating_app = false;
+                    }
+                    let Some(ui) = ui_thread_weak.upgrade() else {
+                        return;
+                    };
+                    ui.set_is_updating_app(false);
+                    ui.set_is_indeterminate(false);
+                    match res {
+                        Ok(()) => {
+                            ui.set_status_title(SharedString::from("Riavvio in corso..."));
+                            ui.set_status_detail(SharedString::from(
+                                "Sostituzione dell'eseguibile e riavvio automatico...",
+                            ));
+                            std::process::exit(0);
+                        }
+                        Err(err) => {
+                            ui.set_status_title(SharedString::from("Aggiornamento non riuscito"));
+                            ui.set_status_detail(SharedString::from(
+                                "Il file attuale non è stato modificato.",
+                            ));
+                            ui.set_banner_error(SharedString::from(err));
+                        }
+                    }
+                });
+            });
         });
     }
 
@@ -518,7 +618,11 @@ fn main() -> Result<(), slint::PlatformError> {
         let ui_weak = ui.as_weak();
         let state = state.clone();
         ui.window().on_close_requested(move || {
-            if state.lock().map(|s| s.running).unwrap_or(false) {
+            if state
+                .lock()
+                .map(|s| s.running || s.updating_app)
+                .unwrap_or(false)
+            {
                 if let Some(ui) = ui_weak.upgrade() {
                     ui.invoke_show_busy_dialog();
                 }
@@ -533,7 +637,11 @@ fn main() -> Result<(), slint::PlatformError> {
 }
 
 fn trigger_download(ui: &AppWindow, state: &Arc<Mutex<AppState>>) {
-    if state.lock().map(|s| s.running).unwrap_or(false) {
+    if state
+        .lock()
+        .map(|s| s.running || s.updating_app)
+        .unwrap_or(false)
+    {
         return;
     }
 

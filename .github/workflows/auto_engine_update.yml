@@ -1,0 +1,70 @@
+name: Auto Update Engine
+
+on:
+  schedule:
+    - cron: '0 6 * * *' # Daily at 06:00 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  update-engine:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Check for md_downloader / md_api updates
+        id: check
+        shell: pwsh
+        run: |
+          cargo update -p md_downloader -p md_api
+          git diff --quiet Cargo.lock
+          if ($LASTEXITCODE -eq 0) {
+            Write-Host "No md_downloader or md_api crate updates available."
+            echo "changed=false" >> $env:GITHUB_OUTPUT
+          } else {
+            Write-Host "Crate update detected in Cargo.lock."
+            echo "changed=true" >> $env:GITHUB_OUTPUT
+          }
+
+      - name: Bump version, test, build and publish release
+        if: steps.check.outputs.changed == 'true'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $cargoContent = Get-Content Cargo.toml -Raw
+          $m = [regex]::Match($cargoContent, 'version = "(\d+)\.(\d+)\.(\d+)"')
+          $major = [int]$m.Groups[1].Value
+          $minor = [int]$m.Groups[2].Value
+          $patch = [int]$m.Groups[3].Value + 1
+          $newVer = "$major.$minor.$patch"
+          $newTag = "v$newVer"
+
+          $cargoContent = [regex]::Replace($cargoContent, 'version = "\d+\.\d+\.\d+"', "version = `"$newVer`"", 1)
+          Set-Content Cargo.toml $cargoContent -NoNewline
+
+          $upstream = (gh api repos/NicKoehler/mediafire_rs/releases/latest --jq .tag_name 2>$null)
+          if ($LASTEXITCODE -eq 0 -and $upstream) {
+            $engineVer = $upstream.Trim().TrimStart('v')
+            $uc = Get-Content src/update_check.rs -Raw
+            $uc = $uc -replace 'EMBEDDED_ENGINE_VERSION: &str = "[^"]+"', "EMBEDDED_ENGINE_VERSION: &str = `"$engineVer`""
+            Set-Content src/update_check.rs $uc -NoNewline
+          }
+
+          cargo test --all-targets --locked
+          cargo build --release --locked
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Cargo.toml Cargo.lock src/update_check.rs
+          git commit -m "chore(engine): update md_downloader ($newTag)"
+          git tag $newTag
+          git push origin main --tags
+
+          gh release create $newTag "target\release\MediaFireMini.exe" --title "MediaFire Mini $newTag" --generate-notes

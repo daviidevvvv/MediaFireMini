@@ -24,8 +24,12 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         shell: pwsh
         run: |
-          if ($env:GITHUB_REF_TYPE -ne "tag") { exit 0 }
-          $tag = $env:GITHUB_REF_NAME
+          $tag = if ($env:GITHUB_REF_TYPE -eq "tag") {
+            $env:GITHUB_REF_NAME
+          } else {
+            $ver = (Select-String -Path Cargo.toml -Pattern '^version = "(.*)"').Matches[0].Groups[1].Value
+            "v$ver"
+          }
           $asset = "target\release\MediaFireMini.exe"
           $exists = gh release view $tag 2>$null
           if ($LASTEXITCODE -eq 0) {

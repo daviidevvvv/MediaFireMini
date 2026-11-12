@@ -56,10 +56,12 @@ export component AppWindow inherits MaterialWindow {
     in property <string> banner_error: "";
     in property <string> app_version: "v0.3.0";
 
-    // Engine update check (read-only notice for NicKoehler/mediafire_rs)
+    // Update check & single-EXE self-update state
     in property <bool> is_checking_engine: false;
+    in property <bool> is_updating_app: false;
+    in property <bool> app_update_available: false;
     in property <bool> engine_update_available: false;
-    in property <string> engine_status_text: "Controllo mediafire_rs su GitHub...";
+    in property <string> engine_status_text: "Controllo aggiornamenti su GitHub...";
     in property <string> engine_update_banner: "";
 
     // File selector state
@@ -82,6 +84,7 @@ export component AppWindow inherits MaterialWindow {
     callback dismiss_error();
 
     callback check_engine_updates();
+    callback apply_app_update();
     callback open_engine_release();
 
     callback close_selector();
@@ -175,9 +178,9 @@ export component AppWindow inherits MaterialWindow {
             }
         }
 
-        // Read-only engine update notice banner (shown when a newer mediafire_rs tag exists)
-        if root.engine_update_available : Rectangle {
-            background: MaterialPalette.tertiary_container;
+        // Update banner (either 1-click single-EXE self-update or upstream mediafire_rs notice)
+        if root.app_update_available || root.engine_update_available : Rectangle {
+            background: root.app_update_available ? MaterialPalette.primary_container : MaterialPalette.tertiary_container;
             border_radius: MaterialStyleMetrics.border_radius_12;
             vertical-stretch: 0;
 
@@ -189,12 +192,18 @@ export component AppWindow inherits MaterialWindow {
                     horizontal-stretch: 1;
                     text: root.engine_update_banner;
                     style: MaterialTypography.body_small;
-                    color: MaterialPalette.on_tertiary_container;
+                    color: root.app_update_available ? MaterialPalette.on_primary_container : MaterialPalette.on_tertiary_container;
                     wrap: word-wrap;
                     vertical_alignment: center;
                 }
 
-                TonalButton {
+                if root.app_update_available : FilledButton {
+                    text: root.is_updating_app ? "Aggiorno..." : "Aggiorna ora";
+                    enabled: !root.is_updating_app && !root.is_running;
+                    clicked => { root.apply_app_update(); }
+                }
+
+                if !root.app_update_available && root.engine_update_available : TonalButton {
                     text: "Apri GitHub";
                     clicked => { root.open_engine_release(); }
                 }
@@ -385,13 +394,13 @@ export component AppWindow inherits MaterialWindow {
                     : (root.has_selection
                         ? "Scarica (" + root.selected_count + "/" + root.total_scanned + ")"
                         : "Scarica");
-                enabled: !root.is_running && (!root.has_selection || root.selected_count > 0);
+                enabled: !root.is_running && !root.is_updating_app && (!root.has_selection || root.selected_count > 0);
                 clicked => { root.start_download(); }
             }
 
             TonalButton {
                 text: "Scegli file...";
-                enabled: !root.is_running;
+                enabled: !root.is_running && !root.is_updating_app;
                 clicked => { root.open_file_selector(); }
             }
 
@@ -513,8 +522,8 @@ export component AppWindow inherits MaterialWindow {
             }
 
             TextButton {
-                text: root.is_checking_engine ? "Verifica..." : "Verifica motore";
-                enabled: !root.is_checking_engine && !root.is_running;
+                text: root.is_checking_engine ? "Verifica..." : "Verifica aggiornamenti";
+                enabled: !root.is_checking_engine && !root.is_running && !root.is_updating_app;
                 clicked => { root.check_engine_updates(); }
             }
         }
