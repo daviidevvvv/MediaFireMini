@@ -1,435 +1,803 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod download;
-mod updater;
+mod update_check;
 
-use nwg;
+use download::{CancelToken, ScannedFile, Update};
+use slint::{CloseRequestResponse, ComponentHandle, ModelRc, SharedString, VecModel};
 use std::{
-    cell::RefCell,
     path::PathBuf,
     process::Command,
-    rc::Rc,
-    sync::{atomic::{AtomicBool, Ordering}, mpsc, Arc},
+    sync::{Arc, Mutex},
     thread,
 };
-use download::Update;
-use updater::{Available, Kind};
+use update_check::{EngineCheckResult, EMBEDDED_ENGINE_VERSION, RELEASES_PAGE_URL};
 
-enum UiEvent {
-    Download(Update),
-    Checked(Vec<Available>, Vec<String>),
-    Updating(String),
-    Updated(String),
-    GuiStaged(PathBuf, String),
-    UpdateError(String),
+slint::include_modules!();
+
+struct SelectableFile {
+    scanned: ScannedFile,
+    name: String,
+    rel_folder: String,
+    size_text: String,
+    checked: bool,
 }
 
-#[derive(Default)]
+struct ScannedCache {
+    url: String,
+    key: String,
+    items: Vec<SelectableFile>,
+}
+
 struct AppState {
     running: bool,
-    updating: bool,
-    checking: bool,
-    cancel: Option<Arc<AtomicBool>>,
+    checking_engine: bool,
+    cancel: Option<CancelToken>,
     last_folder: Option<PathBuf>,
-    updates: Vec<Available>,
+    engine_release_url: String,
+    scanned: Option<ScannedCache>,
 }
 
-fn update_status(updates: &[Available]) -> String {
-    if updates.is_empty() {
-        let v = updater::app_dir().ok().and_then(|p| updater::engine_version(&p).ok())
-            .unwrap_or_else(|| "sconosciuta".into());
-        return format!("Aggiornato. MDRS {v} | GUI v{}", env!("CARGO_PKG_VERSION"));
+impl Default for AppState {
+    fn default() -> Self {
+        Self {
+            running: false,
+            checking_engine: false,
+            cancel: None,
+            last_folder: None,
+            engine_release_url: RELEASES_PAGE_URL.to_owned(),
+            scanned: None,
+        }
     }
-    let versions: Vec<String> = updates.iter().map(|v| {
-        let name = if v.kind == Kind::Engine { "MDRS" } else { "GUI" };
-        format!("{name} {}", v.version)
-    }).collect();
-    format!("Nuova release: {}", versions.join(", "))
 }
 
-fn main() {
-    nwg::init().expect("Impossibile inizializzare Windows");
-    nwg::Font::set_global_family("Segoe UI").expect("Font di sistema mancante");
+fn default_downloads_dir() -> PathBuf {
+    let home = std::env::var_os("USERPROFILE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."));
+    let downloads = home.join("Downloads");
+    if downloads.is_dir() {
+        downloads
+    } else {
+        home
+    }
+}
 
-    let mut window = nwg::Window::default();
-    nwg::Window::builder()
-        .size((640, 401))
-        .position((250, 140))
-        .title("MediaFire Mini  |  Rust + MDRS")
-        .flags(nwg::WindowFlags::WINDOW | nwg::WindowFlags::VISIBLE)
-        .build(&mut window).unwrap();
+fn format_size(bytes: u64) -> String {
+    const KIB: f64 = 1024.0;
+    const MIB: f64 = 1_048_576.0;
+    const GIB: f64 = 1_073_741_824.0;
+    let b = bytes as f64;
+    if b >= GIB {
+        format!("{:.2} GiB", b / GIB)
+    } else if b >= MIB {
+        format!("{:.1} MiB", b / MIB)
+    } else if b >= KIB {
+        format!("{:.0} KiB", b / KIB)
+    } else {
+        format!("{bytes} B")
+    }
+}
 
-    let mut title = nwg::Label::default();
-    nwg::Label::builder()
-        .text(&format!("MediaFire Mini v{}", env!("CARGO_PKG_VERSION")))
-        .position((20, 16)).size((590, 27)).parent(&window)
-        .build(&mut title).unwrap();
+fn format_mib(bytes: u64) -> String {
+    format!("{:.1} MiB", bytes as f64 / 1_048_576.0)
+}
 
-    let mut subtitle = nwg::Label::default();
-    nwg::Label::builder()
-        .text("Incolla il link, scarica la cartella, crea un unico ZIP.")
-        .position((20, 45)).size((585, 19)).parent(&window)
-        .build(&mut subtitle).unwrap();
+fn split_rel_path(rel_path: &str) -> (String, String) {
+    match rel_path.rsplit_once('/') {
+        Some((dir, name)) => (name.to_owned(), dir.to_owned()),
+        None => (rel_path.to_owned(), String::new()),
+    }
+}
 
-    let mut link_label = nwg::Label::default();
-    nwg::Label::builder().text("Link MediaFire")
-        .position((20, 79)).size((585, 18)).parent(&window)
-        .build(&mut link_label).unwrap();
+fn item_matches_filter(item: &SelectableFile, filter_lower: &str) -> bool {
+    filter_lower.is_empty() || item.scanned.rel_path.to_lowercase().contains(filter_lower)
+}
 
-    let mut link = nwg::TextInput::default();
-    nwg::TextInput::builder()
-        .text("https://www.mediafire.com/folder/r1xp6x0i043wx")
-        .position((20, 99)).size((590, 28)).parent(&window)
-        .build(&mut link).unwrap();
+fn sync_selector_ui(ui: &AppWindow, state: &AppState) {
+    let Some(cache) = state.scanned.as_ref() else {
+        ui.set_has_selection(false);
+        ui.set_selected_count(0);
+        ui.set_total_scanned(0);
+        ui.set_selection_summary(SharedString::default());
+        ui.set_visible_files(ModelRc::new(VecModel::from(Vec::<FileEntry>::new())));
+        return;
+    };
 
-    let mut folder_label = nwg::Label::default();
-    nwg::Label::builder().text("Salva in")
-        .position((20, 141)).size((585, 18)).parent(&window)
-        .build(&mut folder_label).unwrap();
+    let filter_lower = ui.get_filter_text().to_string().trim().to_lowercase();
+    let mut visible = Vec::new();
+    let mut selected_count = 0i32;
+    let mut selected_bytes = 0u64;
 
-    let default_path = std::env::var_os("USERPROFILE")
-        .map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."))
-        .join("Downloads");
-    let mut folder = nwg::TextInput::default();
-    nwg::TextInput::builder()
-        .text(&default_path.to_string_lossy())
-        .position((20, 161)).size((482, 28)).parent(&window)
-        .build(&mut folder).unwrap();
+    for (idx, item) in cache.items.iter().enumerate() {
+        if item.checked {
+            selected_count += 1;
+            selected_bytes = selected_bytes.saturating_add(item.scanned.job.size);
+        }
+        if item_matches_filter(item, &filter_lower) {
+            visible.push(FileEntry {
+                id: idx as i32,
+                name: SharedString::from(&item.name),
+                rel_folder: SharedString::from(&item.rel_folder),
+                size_text: SharedString::from(&item.size_text),
+                checked: item.checked,
+            });
+        }
+    }
 
-    let mut browse = nwg::Button::default();
-    nwg::Button::builder().text("Sfoglia...")
-        .position((514, 161)).size((96, 28)).parent(&window)
-        .build(&mut browse).unwrap();
+    let total = cache.items.len() as i32;
+    ui.set_has_selection(true);
+    ui.set_selected_count(selected_count);
+    ui.set_total_scanned(total);
+    ui.set_selection_summary(SharedString::from(format!(
+        "{selected_count} di {total} file · {}",
+        format_size(selected_bytes)
+    )));
+    ui.set_visible_files(ModelRc::new(VecModel::from(visible)));
+}
 
-    let mut folder_picker = nwg::FileDialog::default();
-    nwg::FileDialog::builder()
-        .title("Scegli la cartella di destinazione")
-        .action(nwg::FileDialogAction::OpenDirectory)
-        .build(&mut folder_picker).unwrap();
+fn invalidate_selection_if_url_changed(
+    ui: &AppWindow,
+    state: &Arc<Mutex<AppState>>,
+    new_url: &str,
+) {
+    let trimmed = new_url.trim();
+    if let Ok(mut guard) = state.lock() {
+        let should_clear = guard.scanned.as_ref().is_some_and(|c| c.url != trimmed);
+        if should_clear {
+            guard.scanned = None;
+            sync_selector_ui(ui, &guard);
+        }
+    }
+}
 
-    let mut checkbox = nwg::CheckBox::default();
-    nwg::CheckBox::builder()
-        .text("Crea anche un archivio ZIP unico (conserva gli originali)")
-        .check_state(nwg::CheckBoxState::Checked)
-        .position((20, 207)).size((590, 22)).parent(&window)
-        .build(&mut checkbox).unwrap();
+fn spawn_engine_check(ui_weak: slint::Weak<AppWindow>, state: Arc<Mutex<AppState>>) {
+    if let Ok(mut guard) = state.lock() {
+        if guard.checking_engine {
+            return;
+        }
+        guard.checking_engine = true;
+    }
+    if let Some(ui) = ui_weak.upgrade() {
+        ui.set_is_checking_engine(true);
+        ui.set_engine_status_text(SharedString::from(format!(
+            "Motore v{EMBEDDED_ENGINE_VERSION} · Controllo mediafire_rs su GitHub..."
+        )));
+    }
 
-    let mut start = nwg::Button::default();
-    nwg::Button::builder().text("Scarica cartella")
-        .position((20, 243)).size((234, 35)).parent(&window)
-        .build(&mut start).unwrap();
+    thread::spawn(move || {
+        let result = update_check::check_latest_engine();
+        let _ = slint::invoke_from_event_loop(move || {
+            if let Ok(mut guard) = state.lock() {
+                guard.checking_engine = false;
+                if let EngineCheckResult::UpdateAvailable { ref url, .. } = result {
+                    guard.engine_release_url = url.clone();
+                }
+            }
+            let Some(ui) = ui_weak.upgrade() else { return };
+            ui.set_is_checking_engine(false);
+            match result {
+                EngineCheckResult::UpToDate { installed } => {
+                    ui.set_engine_update_available(false);
+                    ui.set_engine_update_banner(SharedString::default());
+                    ui.set_engine_status_text(SharedString::from(format!(
+                        "Motore integrato v{installed} · Aggiornato (NicKoehler/mediafire_rs)"
+                    )));
+                }
+                EngineCheckResult::UpdateAvailable {
+                    installed, latest, ..
+                } => {
+                    ui.set_engine_update_available(true);
+                    ui.set_engine_update_banner(SharedString::from(format!(
+                        "Nuova release mediafire_rs {latest} disponibile su GitHub (motore integrato: v{installed})."
+                    )));
+                    ui.set_engine_status_text(SharedString::from(format!(
+                        "Motore integrato v{installed} · Disponibile {latest} su GitHub"
+                    )));
+                }
+                EngineCheckResult::Error(err) => {
+                    ui.set_engine_update_available(false);
+                    ui.set_engine_status_text(SharedString::from(format!(
+                        "Motore integrato v{EMBEDDED_ENGINE_VERSION} · Verifica GitHub non riuscita ({err})"
+                    )));
+                }
+            }
+        });
+    });
+}
 
-    let mut stop = nwg::Button::default();
-    nwg::Button::builder().text("Annulla").enabled(false)
-        .position((265, 243)).size((108, 35)).parent(&window)
-        .build(&mut stop).unwrap();
+fn main() -> Result<(), slint::PlatformError> {
+    let ui = AppWindow::new()?;
+    ui.set_app_version(SharedString::from(format!(
+        "v{}",
+        env!("CARGO_PKG_VERSION")
+    )));
+    ui.set_folder_text(SharedString::from(
+        default_downloads_dir().to_string_lossy().as_ref(),
+    ));
 
-    let mut open = nwg::Button::default();
-    nwg::Button::builder().text("Apri destinazione").enabled(false)
-        .position((385, 243)).size((225, 35)).parent(&window)
-        .build(&mut open).unwrap();
+    let state = Arc::new(Mutex::new(AppState::default()));
 
-    let mut update_label = nwg::Label::default();
-    nwg::Label::builder().text("Controllo aggiornamenti GitHub...")
-        .position((20, 293)).size((395, 21)).parent(&window)
-        .build(&mut update_label).unwrap();
+    // Non-blocking read-only check for mediafire_rs releases on startup
+    spawn_engine_check(ui.as_weak(), state.clone());
 
-    let mut check_button = nwg::Button::default();
-    nwg::Button::builder().text("Verifica").enabled(false)
-        .position((417, 287)).size((86, 28)).parent(&window)
-        .build(&mut check_button).unwrap();
-
-    let mut update_button = nwg::Button::default();
-    nwg::Button::builder().text("Aggiorna").enabled(false)
-        .position((511, 287)).size((99, 28)).parent(&window)
-        .build(&mut update_button).unwrap();
-
-    let mut status = nwg::Label::default();
-    nwg::Label::builder().text("Pronto. I download non modificano i file del gioco.")
-        .position((20, 330)).size((590, 19)).parent(&window)
-        .build(&mut status).unwrap();
-
-    let mut progress = nwg::ProgressBar::default();
-    nwg::ProgressBar::builder().range(0..100)
-        .flags(nwg::ProgressBarFlags::VISIBLE | nwg::ProgressBarFlags::MARQUEE)
-        .position((20, 354)).size((590, 12)).parent(&window)
-        .build(&mut progress).unwrap();
-    progress.set_marquee(false, 60);
-
-    let mut notice = nwg::Notice::default();
-    nwg::Notice::builder().parent(&window).build(&mut notice).unwrap();
-
-    let (sender, receiver) = mpsc::channel::<UiEvent>();
-    let receiver = Rc::new(RefCell::new(receiver));
-    let state = Rc::new(RefCell::new(AppState::default()));
-    state.borrow_mut().checking = true;
-    let ui_window = Rc::new(window);
-    let handler_window = ui_window.clone();
-    let notifier = notice.sender();
-
-    // Read-only startup check, off UI thread. No downloads until user chooses Update.
+    // Manual engine update check
     {
-        let tx = sender.clone();
-        let alert = notifier.clone();
-        thread::spawn(move || {
-            let (available, errors) = match updater::app_dir() {
-                Ok(path) => updater::check(&path),
-                Err(e) => (Vec::new(), vec![e]),
-            };
-            let _ = tx.send(UiEvent::Checked(available, errors));
-            alert.notice();
+        let ui_weak = ui.as_weak();
+        let state = state.clone();
+        ui.on_check_engine_updates(move || {
+            spawn_engine_check(ui_weak.clone(), state.clone());
         });
     }
 
-    let handler = nwg::full_bind_event_handler(&ui_window.handle, move |event, _data, handle| {
-        use nwg::Event as E;
-        match event {
-            E::OnWindowClose if handle == handler_window.handle => {
-                if state.borrow().running || state.borrow().updating {
-                    nwg::modal_info_message(&handler_window.handle, "Operazione in corso",
-                        "Completa o annulla l'operazione prima di chiudere.");
-                } else { nwg::stop_thread_dispatch(); }
+    // Open GitHub release page in default browser
+    {
+        let state = state.clone();
+        ui.on_open_engine_release(move || {
+            if let Ok(guard) = state.lock() {
+                let url = &guard.engine_release_url;
+                if url.starts_with("https://github.com/NicKoehler/mediafire_rs/") {
+                    let _ = Command::new("rundll32.exe")
+                        .args(["url.dll,FileProtocolHandler", url])
+                        .spawn();
+                }
             }
-            E::OnButtonClick if handle == browse.handle => {
-                if folder_picker.run(Some(&*handler_window)) {
-                    if let Ok(selected) = folder_picker.get_selected_item() {
-                        folder.set_text(&selected.to_string_lossy());
+        });
+    }
+
+    // Paste link from clipboard
+    {
+        let ui_weak = ui.as_weak();
+        let state = state.clone();
+        ui.on_paste_url(move || {
+            let Some(ui) = ui_weak.upgrade() else { return };
+            if let Ok(mut clipboard) = arboard::Clipboard::new() {
+                if let Ok(text) = clipboard.get_text() {
+                    let trimmed = text.trim();
+                    if !trimmed.is_empty() {
+                        ui.set_url_text(SharedString::from(trimmed));
+                        ui.set_url_error(SharedString::default());
+                        ui.set_banner_error(SharedString::default());
+                        invalidate_selection_if_url_changed(&ui, &state, trimmed);
                     }
                 }
             }
-            E::OnButtonClick if handle == start.handle => {
-                if state.borrow().running || state.borrow().updating { return; }
-                let url = link.text().trim().to_owned();
-                if let Err(err) = download::parse_key(&url) {
-                    nwg::modal_error_message(&handler_window.handle, "Link non valido", &err);
+        });
+    }
+
+    // Clear URL input
+    {
+        let ui_weak = ui.as_weak();
+        let state = state.clone();
+        ui.on_clear_url(move || {
+            let Some(ui) = ui_weak.upgrade() else { return };
+            ui.set_url_text(SharedString::default());
+            ui.set_url_error(SharedString::default());
+            invalidate_selection_if_url_changed(&ui, &state, "");
+        });
+    }
+
+    // Track URL edits to clear stale selection
+    {
+        let ui_weak = ui.as_weak();
+        let state = state.clone();
+        ui.on_url_edited(move |txt| {
+            let Some(ui) = ui_weak.upgrade() else { return };
+            ui.set_url_error(SharedString::default());
+            invalidate_selection_if_url_changed(&ui, &state, txt.as_str());
+        });
+    }
+
+    // Native Windows folder picker
+    {
+        let ui_weak = ui.as_weak();
+        ui.on_browse_folder(move || {
+            let Some(ui) = ui_weak.upgrade() else { return };
+            let current = PathBuf::from(ui.get_folder_text().as_str().trim());
+            let mut dialog = rfd::FileDialog::new().set_title("Scegli la cartella di destinazione");
+            if current.is_dir() {
+                dialog = dialog.set_directory(&current);
+            }
+            if let Some(selected) = dialog.pick_folder() {
+                ui.set_folder_text(SharedString::from(selected.to_string_lossy().as_ref()));
+                ui.set_folder_error(SharedString::default());
+                ui.set_banner_error(SharedString::default());
+            }
+        });
+    }
+
+    // Dismiss error banner
+    {
+        let ui_weak = ui.as_weak();
+        ui.on_dismiss_error(move || {
+            let Some(ui) = ui_weak.upgrade() else { return };
+            ui.set_banner_error(SharedString::default());
+        });
+    }
+
+    // Open destination folder in Explorer
+    {
+        let state = state.clone();
+        ui.on_open_destination(move || {
+            if let Ok(guard) = state.lock() {
+                if let Some(folder) = guard.last_folder.as_ref() {
+                    let _ = Command::new("explorer.exe").arg(folder).spawn();
+                }
+            }
+        });
+    }
+
+    // Cancel active scan/download/zip
+    {
+        let ui_weak = ui.as_weak();
+        let state = state.clone();
+        ui.on_cancel_download(move || {
+            if let Ok(guard) = state.lock() {
+                if let Some(cancel) = guard.cancel.as_ref() {
+                    cancel.cancel();
+                    if let Some(ui) = ui_weak.upgrade() {
+                        ui.set_is_cancelling(true);
+                        ui.set_is_indeterminate(true);
+                        ui.set_status_title(SharedString::from("Annullamento in corso..."));
+                    }
+                }
+            }
+        });
+    }
+
+    // Open or scan for the File Selector
+    {
+        let ui_weak = ui.as_weak();
+        let state = state.clone();
+        ui.on_open_file_selector(move || {
+            let Some(ui) = ui_weak.upgrade() else { return };
+            if state.lock().map(|s| s.running).unwrap_or(false) {
+                return;
+            }
+
+            let url = ui.get_url_text().to_string().trim().to_owned();
+            ui.set_url_error(SharedString::default());
+            ui.set_banner_error(SharedString::default());
+
+            if let Err(err) = download::parse_key(&url) {
+                ui.set_url_error(SharedString::from(err));
+                return;
+            }
+
+            // If already scanned for this exact URL, open the selector immediately.
+            if let Ok(guard) = state.lock() {
+                if guard.scanned.as_ref().is_some_and(|c| c.url == url) {
+                    sync_selector_ui(&ui, &guard);
+                    ui.set_selector_open(true);
                     return;
                 }
-                let output = PathBuf::from(folder.text().trim());
-                if !output.is_dir() {
-                    nwg::modal_error_message(&handler_window.handle, "Cartella non valida",
-                        "Seleziona una cartella di destinazione esistente.");
-                    return;
-                }
-                let mdrs = std::env::current_exe().unwrap_or_default().with_file_name("mdrs.exe");
-                if !mdrs.is_file() {
-                    nwg::modal_error_message(&handler_window.handle, "MDRS mancante",
-                        "mdrs.exe deve trovarsi accanto a MediaFireMini.exe.");
-                    return;
-                }
-                let zip = checkbox.check_state() == nwg::CheckBoxState::Checked;
-                let cancelled = Arc::new(AtomicBool::new(false));
-                {
-                    let mut current = state.borrow_mut();
-                    current.running = true;
-                    current.cancel = Some(cancelled.clone());
-                    current.last_folder = None;
-                }
-                link.set_enabled(false); folder.set_enabled(false);
-                browse.set_enabled(false); checkbox.set_enabled(false);
-                start.set_enabled(false); stop.set_enabled(true);
-                open.set_enabled(false); update_button.set_enabled(false);
-                check_button.set_enabled(false);
-                progress.set_pos(0); progress.set_marquee(true, 45);
-                status.set_text("Inizio download...");
-                let tx = sender.clone();
-                let alert = notifier.clone();
-                thread::spawn(move || {
-                    download::run(&mdrs, &url, &output, zip, cancelled, move |msg| {
-                        let _ = tx.send(UiEvent::Download(msg));
-                        alert.notice();
+            }
+
+            let cancel = CancelToken::new();
+            if let Ok(mut cur) = state.lock() {
+                cur.running = true;
+                cur.cancel = Some(cancel.clone());
+            }
+
+            ui.set_is_running(true);
+            ui.set_is_indeterminate(true);
+            ui.set_is_cancelling(false);
+            ui.set_progress_value(0.0);
+            ui.set_status_title(SharedString::from("Analisi dei file in corso..."));
+            ui.set_status_detail(SharedString::from("Recupero elenco da MediaFire..."));
+            ui.set_progress_summary(SharedString::default());
+
+            let ui_thread_weak = ui.as_weak();
+            let state_thread = state.clone();
+            let scanned_url = url.clone();
+
+            thread::spawn(move || {
+                download::scan(&url, cancel, move |update| {
+                    let ui_weak = ui_thread_weak.clone();
+                    let state = state_thread.clone();
+                    let scanned_url = scanned_url.clone();
+                    let _ = slint::invoke_from_event_loop(move || {
+                        let Some(ui) = ui_weak.upgrade() else { return };
+                        handle_update(&ui, &state, Some(&scanned_url), update);
                     });
                 });
+            });
+        });
+    }
+
+    // Selector UI controls
+    {
+        let ui_weak = ui.as_weak();
+        ui.on_close_selector(move || {
+            if let Some(ui) = ui_weak.upgrade() {
+                ui.set_selector_open(false);
             }
-            E::OnButtonClick if handle == stop.handle => {
-                if let Some(flag) = state.borrow().cancel.as_ref() {
-                    flag.store(true, Ordering::Relaxed);
-                    status.set_text("Annullamento in corso...");
-                    stop.set_enabled(false);
-                }
+        });
+    }
+
+    {
+        let ui_weak = ui.as_weak();
+        let state = state.clone();
+        ui.on_reset_selection(move || {
+            let Some(ui) = ui_weak.upgrade() else { return };
+            if let Ok(mut guard) = state.lock() {
+                guard.scanned = None;
+                sync_selector_ui(&ui, &guard);
             }
-            E::OnButtonClick if handle == open.handle => {
-                if let Some(last) = state.borrow().last_folder.as_ref() {
-                    let _ = Command::new("explorer.exe").arg(last).spawn();
-                }
+        });
+    }
+
+    {
+        let ui_weak = ui.as_weak();
+        let state = state.clone();
+        ui.on_filter_changed(move |txt| {
+            let Some(ui) = ui_weak.upgrade() else { return };
+            ui.set_filter_text(txt);
+            if let Ok(guard) = state.lock() {
+                sync_selector_ui(&ui, &guard);
             }
-            E::OnButtonClick if handle == check_button.handle => {
-                if state.borrow().running || state.borrow().updating { return; }
-                state.borrow_mut().checking = true;
-                update_label.set_text("Controllo aggiornamenti GitHub...");
-                check_button.set_enabled(false);
-                update_button.set_enabled(false);
-                let tx = sender.clone();
-                let alert = notifier.clone();
-                thread::spawn(move || {
-                    let (found, errors) = match updater::app_dir() {
-                        Ok(path) => updater::check(&path),
-                        Err(e) => (Vec::new(), vec![e]),
-                    };
-                    let _ = tx.send(UiEvent::Checked(found, errors));
-                    alert.notice();
-                });
-            }
-            E::OnButtonClick if handle == update_button.handle => {
-                if state.borrow().running || state.borrow().updating || state.borrow().checking {
-                    return;
-                }
-                let packages = state.borrow().updates.clone();
-                if packages.is_empty() { return; }
-                state.borrow_mut().updating = true;
-                link.set_enabled(false); folder.set_enabled(false); browse.set_enabled(false);
-                checkbox.set_enabled(false); start.set_enabled(false);
-                stop.set_enabled(false); open.set_enabled(false);
-                check_button.set_enabled(false); update_button.set_enabled(false);
-                update_label.set_text("Aggiornamento in corso...");
-                progress.set_pos(0); progress.set_marquee(true, 45);
-                let tx = sender.clone();
-                let alert = notifier.clone();
-                thread::spawn(move || {
-                    let folder = match updater::app_dir() {
-                        Ok(p) => p,
-                        Err(e) => {
-                            let _ = tx.send(UiEvent::UpdateError(e));
-                            alert.notice(); return;
-                        }
-                    };
-                    for package in &packages {
-                        let name = if package.kind == Kind::Engine { "MDRS" } else { "GUI" };
-                        let _ = tx.send(UiEvent::Updating(format!(
-                            "Scarico {name} {} da GitHub...", package.version)));
-                        alert.notice();
-                        match package.kind {
-                            Kind::Engine => match updater::install_engine(&folder, package) {
-                                Ok(version) => {
-                                    let _ = tx.send(UiEvent::Updating(format!(
-                                        "MDRS aggiornato alla {version}. Backup precedente conservato.")));
-                                    alert.notice();
-                                }
-                                Err(err) => { let _ = tx.send(UiEvent::UpdateError(err)); alert.notice(); return; }
-                            },
-                            Kind::Gui => match updater::stage_gui(&folder, package) {
-                                Ok(staged) => {
-                                    let _ = tx.send(UiEvent::GuiStaged(staged, package.digest.clone()));
-                                    alert.notice(); return;
-                                }
-                                Err(err) => { let _ = tx.send(UiEvent::UpdateError(err)); alert.notice(); return; }
-                            },
-                        }
+        });
+    }
+
+    {
+        let ui_weak = ui.as_weak();
+        let state = state.clone();
+        ui.on_toggle_file(move |id| {
+            let Some(ui) = ui_weak.upgrade() else { return };
+            if let Ok(mut guard) = state.lock() {
+                if let Some(cache) = guard.scanned.as_mut() {
+                    if let Some(item) = cache.items.get_mut(id as usize) {
+                        item.checked = !item.checked;
                     }
-                    let _ = tx.send(UiEvent::Updated("Aggiornamento riuscito.".into()));
-                    alert.notice();
-                });
+                }
+                sync_selector_ui(&ui, &guard);
             }
-            E::OnNotice if handle == notice.handle => {
-                while let Ok(message) = receiver.borrow().try_recv() {
-                    match message {
-                        UiEvent::Checked(available, errors) => {
-                            let mut current = state.borrow_mut();
-                            current.checking = false;
-                            current.updates = available;
-                            let is_busy = current.running || current.updating;
-                            update_button.set_enabled(!is_busy && !current.updates.is_empty());
-                            check_button.set_enabled(!is_busy);
-                            let text = if current.updates.is_empty() && !errors.is_empty() {
-                                "Verifica GitHub non riuscita. Premi Verifica.".into()
-                            } else {
-                                update_status(&current.updates)
-                            };
-                            let notify = !current.updates.is_empty() && !is_busy;
-                            let notes = current.updates.first().map(|v| v.description.clone()).unwrap_or_default();
-                            update_label.set_text(&text);
-                            drop(current);
-                            if notify {
-                                nwg::modal_info_message(&handler_window.handle, "Nuovo aggiornamento",
-                                    &format!("{text}\n{notes}\nPremi 'Aggiorna' per applicarlo.\nI vecchi file vengono conservati."));
-                            }
-                        }
-                        UiEvent::Updating(text) => update_label.set_text(&text),
-                        UiEvent::Updated(text) => {
-                            {
-                                let mut cur = state.borrow_mut();
-                                cur.updating = false;
-                                cur.updates.clear();
-                            }
-                            progress.set_marquee(false, 45); progress.set_pos(100);
-                            link.set_enabled(true); folder.set_enabled(true);
-                            browse.set_enabled(true); checkbox.set_enabled(true);
-                            start.set_enabled(true); check_button.set_enabled(true);
-                            update_button.set_enabled(false);
-                            update_label.set_text(&update_status(&[]));
-                            status.set_text(&text);
-                        }
-                        UiEvent::GuiStaged(path, hash) => {
-                            let folder = updater::app_dir();
-                            let result = folder.and_then(|dir| updater::start_gui_replacement(&dir, &path, &hash));
-                            match result {
-                                Ok(()) => {
-                                    update_label.set_text("Riavvio con la versione aggiornata...");
-                                    nwg::stop_thread_dispatch();
-                                }
-                                Err(err) => {
-                                    let _ = sender.send(UiEvent::UpdateError(err));
-                                    notifier.notice();
-                                }
-                            }
-                        }
-                        UiEvent::UpdateError(err) => {
-                            state.borrow_mut().updating = false;
-                            progress.set_marquee(false, 45); progress.set_pos(0);
-                            link.set_enabled(true); folder.set_enabled(true);
-                            browse.set_enabled(true); checkbox.set_enabled(true);
-                            start.set_enabled(true); check_button.set_enabled(true);
-                            update_button.set_enabled(!state.borrow().updates.is_empty());
-                            update_label.set_text("Aggiornamento non riuscito.");
-                            nwg::modal_error_message(&handler_window.handle, "Aggiornamento", &err);
-                        }
-                        UiEvent::Download(Update::Info(text)) => status.set_text(&text),
-                        UiEvent::Download(Update::Done { folder: downloaded, zip, files, bytes }) => {
-                            {
-                                let mut cur = state.borrow_mut();
-                                cur.running = false; cur.cancel = None;
-                                cur.last_folder = Some(downloaded);
-                            }
-                            progress.set_marquee(false, 45); progress.set_pos(100);
-                            let suffix = if zip.is_some() { " | ZIP pronto" } else { "" };
-                            status.set_text(&format!("Completato: {} file, {:.1} MiB{}",
-                                files, bytes as f64 / 1_048_576.0, suffix));
-                            link.set_enabled(true); folder.set_enabled(true);
-                            browse.set_enabled(true); checkbox.set_enabled(true);
-                            start.set_enabled(true); stop.set_enabled(false); open.set_enabled(true);
-                            check_button.set_enabled(!state.borrow().checking);
-                            update_button.set_enabled(!state.borrow().updates.is_empty() && !state.borrow().checking);
-                        }
-                        UiEvent::Download(Update::Cancelled(downloaded)) => {
-                            let mut cur = state.borrow_mut();
-                            cur.running = false; cur.cancel = None;
-                            cur.last_folder = Some(downloaded);
-                            drop(cur);
-                            progress.set_marquee(false, 45); progress.set_pos(0);
-                            status.set_text("Annullato: i file parziali sono conservati.");
-                            link.set_enabled(true); folder.set_enabled(true);
-                            browse.set_enabled(true); checkbox.set_enabled(true);
-                            start.set_enabled(true); stop.set_enabled(false); open.set_enabled(true);
-                            check_button.set_enabled(!state.borrow().checking);
-                            update_button.set_enabled(!state.borrow().updates.is_empty() && !state.borrow().checking);
-                        }
-                        UiEvent::Download(Update::Error(err)) => {
-                            state.borrow_mut().running = false;
-                            state.borrow_mut().cancel = None;
-                            progress.set_marquee(false, 45); progress.set_pos(0);
-                            status.set_text("Download fallito. Controlla il log.");
-                            link.set_enabled(true); folder.set_enabled(true);
-                            browse.set_enabled(true); checkbox.set_enabled(true);
-                            start.set_enabled(true); stop.set_enabled(false);
-                            check_button.set_enabled(!state.borrow().checking);
-                            update_button.set_enabled(!state.borrow().updates.is_empty() && !state.borrow().checking);
-                            nwg::modal_error_message(&handler_window.handle, "Errore download", &err);
+        });
+    }
+
+    {
+        let ui_weak = ui.as_weak();
+        let state = state.clone();
+        ui.on_select_all_visible(move || {
+            let Some(ui) = ui_weak.upgrade() else { return };
+            let filter_lower = ui.get_filter_text().to_string().trim().to_lowercase();
+            if let Ok(mut guard) = state.lock() {
+                if let Some(cache) = guard.scanned.as_mut() {
+                    for item in &mut cache.items {
+                        if item_matches_filter(item, &filter_lower) {
+                            item.checked = true;
                         }
                     }
                 }
+                sync_selector_ui(&ui, &guard);
             }
-            _ => {}
+        });
+    }
+
+    {
+        let ui_weak = ui.as_weak();
+        let state = state.clone();
+        ui.on_deselect_all_visible(move || {
+            let Some(ui) = ui_weak.upgrade() else { return };
+            let filter_lower = ui.get_filter_text().to_string().trim().to_lowercase();
+            if let Ok(mut guard) = state.lock() {
+                if let Some(cache) = guard.scanned.as_mut() {
+                    for item in &mut cache.items {
+                        if item_matches_filter(item, &filter_lower) {
+                            item.checked = false;
+                        }
+                    }
+                }
+                sync_selector_ui(&ui, &guard);
+            }
+        });
+    }
+
+    // Start download from selector or main screen
+    {
+        let ui_weak = ui.as_weak();
+        let state = state.clone();
+        ui.on_start_selected_download(move || {
+            let Some(ui) = ui_weak.upgrade() else { return };
+            ui.set_selector_open(false);
+            trigger_download(&ui, &state);
+        });
+    }
+
+    {
+        let ui_weak = ui.as_weak();
+        let state = state.clone();
+        ui.on_start_download(move || {
+            let Some(ui) = ui_weak.upgrade() else { return };
+            trigger_download(&ui, &state);
+        });
+    }
+
+    // Prevent closing while an operation is active
+    {
+        let ui_weak = ui.as_weak();
+        let state = state.clone();
+        ui.window().on_close_requested(move || {
+            if state.lock().map(|s| s.running).unwrap_or(false) {
+                if let Some(ui) = ui_weak.upgrade() {
+                    ui.invoke_show_busy_dialog();
+                }
+                CloseRequestResponse::KeepWindowShown
+            } else {
+                CloseRequestResponse::HideWindow
+            }
+        });
+    }
+
+    ui.run()
+}
+
+fn trigger_download(ui: &AppWindow, state: &Arc<Mutex<AppState>>) {
+    if state.lock().map(|s| s.running).unwrap_or(false) {
+        return;
+    }
+
+    let url = ui.get_url_text().to_string().trim().to_owned();
+    let folder_str = ui.get_folder_text().to_string().trim().to_owned();
+
+    ui.set_url_error(SharedString::default());
+    ui.set_folder_error(SharedString::default());
+    ui.set_banner_error(SharedString::default());
+
+    if let Err(err) = download::parse_key(&url) {
+        ui.set_url_error(SharedString::from(err));
+        return;
+    }
+
+    let output = PathBuf::from(&folder_str);
+    if !output.is_dir() {
+        ui.set_folder_error(SharedString::from(
+            "Seleziona una cartella di destinazione esistente.",
+        ));
+        return;
+    }
+
+    // Use pre-scanned selection if available for this exact URL.
+    let selected_jobs = {
+        let guard = state.lock().ok();
+        guard.and_then(|g| {
+            g.scanned.as_ref().filter(|c| c.url == url).map(|c| {
+                let jobs: Vec<_> = c
+                    .items
+                    .iter()
+                    .filter(|i| i.checked)
+                    .map(|i| i.scanned.job.clone())
+                    .collect();
+                (c.key.clone(), jobs)
+            })
+        })
+    };
+
+    if let Some((_, ref jobs)) = selected_jobs {
+        if jobs.is_empty() {
+            ui.set_banner_error(SharedString::from(
+                "Nessun file selezionato. Scegli almeno un file oppure clicca 'Scarica tutti'.",
+            ));
+            return;
+        }
+    }
+
+    let make_zip = ui.get_make_zip();
+    let cancel = CancelToken::new();
+
+    if let Ok(mut cur) = state.lock() {
+        cur.running = true;
+        cur.cancel = Some(cancel.clone());
+        cur.last_folder = None;
+    }
+
+    ui.set_is_running(true);
+    ui.set_is_indeterminate(true);
+    ui.set_is_cancelling(false);
+    ui.set_can_open_folder(false);
+    ui.set_progress_value(0.0);
+    ui.set_status_title(SharedString::from("Scansione link MediaFire..."));
+    ui.set_status_detail(SharedString::from("Connessione in corso..."));
+    ui.set_progress_summary(SharedString::default());
+
+    let ui_thread_weak = ui.as_weak();
+    let state_thread = state.clone();
+
+    thread::spawn(move || match selected_jobs {
+        Some((key, jobs)) => {
+            download::run_selected(&key, jobs, &output, make_zip, cancel, move |update| {
+                let ui_weak = ui_thread_weak.clone();
+                let state = state_thread.clone();
+                let _ = slint::invoke_from_event_loop(move || {
+                    let Some(ui) = ui_weak.upgrade() else { return };
+                    handle_update(&ui, &state, None, update);
+                });
+            });
+        }
+        None => {
+            download::run(&url, &output, make_zip, cancel, move |update| {
+                let ui_weak = ui_thread_weak.clone();
+                let state = state_thread.clone();
+                let _ = slint::invoke_from_event_loop(move || {
+                    let Some(ui) = ui_weak.upgrade() else { return };
+                    handle_update(&ui, &state, None, update);
+                });
+            });
         }
     });
-    nwg::dispatch_thread_events();
-    nwg::unbind_event_handler(&handler);
+}
+
+fn handle_update(
+    ui: &AppWindow,
+    state: &Arc<Mutex<AppState>>,
+    scanned_url: Option<&str>,
+    update: Update,
+) {
+    match update {
+        Update::Scanning(msg) => {
+            ui.set_is_indeterminate(true);
+            ui.set_status_title(SharedString::from("Analisi cartella MediaFire..."));
+            ui.set_status_detail(SharedString::from(msg));
+            ui.set_progress_summary(SharedString::default());
+        }
+        Update::ScanReady { key, files } => {
+            let total = files.len();
+            let items: Vec<SelectableFile> = files
+                .into_iter()
+                .map(|scanned| {
+                    let (name, rel_folder) = split_rel_path(&scanned.rel_path);
+                    let size_text = format_size(scanned.job.size);
+                    SelectableFile {
+                        scanned,
+                        name,
+                        rel_folder,
+                        size_text,
+                        checked: true,
+                    }
+                })
+                .collect();
+
+            if let Ok(mut cur) = state.lock() {
+                cur.running = false;
+                cur.cancel = None;
+                cur.scanned = Some(ScannedCache {
+                    url: scanned_url.unwrap_or_default().to_owned(),
+                    key,
+                    items,
+                });
+                sync_selector_ui(ui, &cur);
+            }
+            ui.set_is_running(false);
+            ui.set_is_indeterminate(false);
+            ui.set_is_cancelling(false);
+            ui.set_progress_value(0.0);
+            ui.set_filter_text(SharedString::default());
+            if let Ok(cur) = state.lock() {
+                sync_selector_ui(ui, &cur);
+            }
+            ui.set_status_title(SharedString::from("Elenco pronto"));
+            ui.set_status_detail(SharedString::from(format!(
+                "Trovati {total} file. Seleziona quelli da scaricare."
+            )));
+            ui.set_selector_open(true);
+        }
+        Update::Downloading {
+            completed_files,
+            total_files,
+            downloaded_bytes,
+            total_bytes,
+            current_file,
+        } => {
+            ui.set_is_indeterminate(total_bytes == 0);
+            let ratio = if total_bytes > 0 {
+                (downloaded_bytes as f32 / total_bytes as f32).clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+            ui.set_progress_value(ratio);
+            ui.set_status_title(SharedString::from(format!(
+                "Download in corso ({completed_files}/{total_files} file)"
+            )));
+            let pct = (ratio * 100.0).round() as u32;
+            let summary = if total_bytes > 0 {
+                format!(
+                    "{} / {} · {}%",
+                    format_mib(downloaded_bytes),
+                    format_mib(total_bytes),
+                    pct
+                )
+            } else {
+                format_mib(downloaded_bytes)
+            };
+            ui.set_progress_summary(SharedString::from(summary));
+            ui.set_status_detail(SharedString::from(format!("File: {current_file}")));
+        }
+        Update::Zipping {
+            current,
+            total,
+            current_file,
+        } => {
+            ui.set_is_indeterminate(total == 0);
+            let ratio = if total > 0 {
+                (current as f32 / total as f32).clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+            ui.set_progress_value(ratio);
+            ui.set_status_title(SharedString::from(format!(
+                "Creazione archivio ZIP ({current}/{total})..."
+            )));
+            ui.set_progress_summary(SharedString::from(format!(
+                "{}%",
+                (ratio * 100.0).round() as u32
+            )));
+            ui.set_status_detail(SharedString::from(format!("Compressione: {current_file}")));
+        }
+        Update::Done {
+            folder,
+            zip,
+            files,
+            bytes,
+        } => {
+            if let Ok(mut cur) = state.lock() {
+                cur.running = false;
+                cur.cancel = None;
+                cur.last_folder = Some(folder.clone());
+            }
+            ui.set_is_running(false);
+            ui.set_is_indeterminate(false);
+            ui.set_is_cancelling(false);
+            ui.set_can_open_folder(true);
+            ui.set_progress_value(1.0);
+            ui.set_status_title(SharedString::from("Download completato"));
+            ui.set_progress_summary(SharedString::from(format!(
+                "{files} file · {} · 100%",
+                format_mib(bytes)
+            )));
+            let detail = match zip {
+                Some(zip_path) => format!(
+                    "Salvato in {} e compresso in {}",
+                    folder.display(),
+                    zip_path.file_name().unwrap_or_default().to_string_lossy()
+                ),
+                None => format!("Salvato in {}", folder.display()),
+            };
+            ui.set_status_detail(SharedString::from(detail));
+        }
+        Update::Cancelled { folder, has_files } => {
+            if let Ok(mut cur) = state.lock() {
+                cur.running = false;
+                cur.cancel = None;
+                cur.last_folder = folder;
+            }
+            ui.set_is_running(false);
+            ui.set_is_indeterminate(false);
+            ui.set_is_cancelling(false);
+            ui.set_can_open_folder(has_files);
+            ui.set_progress_value(0.0);
+            ui.set_status_title(SharedString::from("Operazione annullata"));
+            ui.set_progress_summary(SharedString::default());
+            ui.set_status_detail(SharedString::from(if has_files {
+                "I file già scaricati sono stati conservati."
+            } else {
+                "Nessun file scaricato."
+            }));
+        }
+        Update::Error(err) => {
+            if let Ok(mut cur) = state.lock() {
+                cur.running = false;
+                cur.cancel = None;
+            }
+            ui.set_is_running(false);
+            ui.set_is_indeterminate(false);
+            ui.set_is_cancelling(false);
+            ui.set_progress_value(0.0);
+            ui.set_status_title(SharedString::from("Operazione non riuscita"));
+            ui.set_progress_summary(SharedString::default());
+            ui.set_status_detail(SharedString::from(
+                "Controlla il messaggio di errore qui sopra.",
+            ));
+            ui.set_banner_error(SharedString::from(err));
+        }
+    }
 }
