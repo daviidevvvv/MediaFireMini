@@ -23,14 +23,16 @@ jobs:
         shell: pwsh
         run: |
           cargo update -p md_downloader -p md_api
-          git diff --quiet Cargo.lock
-          if ($LASTEXITCODE -eq 0) {
+          git diff --ignore-cr-at-eol --quiet Cargo.lock
+          $hasDiff = ($LASTEXITCODE -ne 0)
+          if (-not $hasDiff) {
             Write-Host "No md_downloader or md_api crate updates available."
-            echo "changed=false" >> $env:GITHUB_OUTPUT
+            "changed=false" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
           } else {
             Write-Host "Crate update detected in Cargo.lock."
-            echo "changed=true" >> $env:GITHUB_OUTPUT
+            "changed=true" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
           }
+          exit 0
 
       - name: Bump version, test, build and publish release
         if: steps.check.outputs.changed == 'true'
