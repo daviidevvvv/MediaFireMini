@@ -22,14 +22,15 @@ jobs:
         id: check
         shell: pwsh
         run: |
+          $before = "$(cargo pkgid md_downloader);$(cargo pkgid md_api)"
           cargo update -p md_downloader -p md_api
-          git diff --ignore-cr-at-eol --quiet Cargo.lock
-          $hasDiff = ($LASTEXITCODE -ne 0)
-          if (-not $hasDiff) {
-            Write-Host "No md_downloader or md_api crate updates available."
+          if ($LASTEXITCODE -ne 0) { throw "cargo update failed" }
+          $after = "$(cargo pkgid md_downloader);$(cargo pkgid md_api)"
+          if ($before -eq $after) {
+            Write-Host "No md_downloader or md_api crate updates available ($after)."
             "changed=false" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
           } else {
-            Write-Host "Crate update detected in Cargo.lock."
+            Write-Host "Crate update detected: $before -> $after"
             "changed=true" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
           }
           exit 0
@@ -59,14 +60,23 @@ jobs:
             Set-Content src/update_check.rs $uc -NoNewline
           }
 
+          cargo update -p MediaFireMini
+          if ($LASTEXITCODE -ne 0) { throw "cargo update -p MediaFireMini failed" }
+
           cargo test --all-targets --locked
+          if ($LASTEXITCODE -ne 0) { throw "cargo test failed" }
+
           cargo build --release --locked
+          if ($LASTEXITCODE -ne 0) { throw "cargo build --release failed" }
 
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add Cargo.toml Cargo.lock src/update_check.rs
           git commit -m "chore(engine): update md_downloader ($newTag)"
+          if ($LASTEXITCODE -ne 0) { throw "git commit failed" }
           git tag $newTag
           git push origin main --tags
+          if ($LASTEXITCODE -ne 0) { throw "git push failed" }
 
           gh release create $newTag "target\release\MediaFireMini.exe" --title "MediaFire Mini $newTag" --generate-notes
+          if ($LASTEXITCODE -ne 0) { throw "gh release create failed" }
