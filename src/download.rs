@@ -84,6 +84,52 @@ pub enum Update {
     Error(String),
 }
 
+/// Compares two strings case-insensitively with natural numeric ordering for ASCII digit runs.
+pub fn cmp_natural_ci(a: &str, b: &str) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+
+    let mut ra = a;
+    let mut rb = b;
+
+    while !ra.is_empty() && !rb.is_empty() {
+        let ba = ra.as_bytes()[0];
+        let bb = rb.as_bytes()[0];
+
+        if ba.is_ascii_digit() && bb.is_ascii_digit() {
+            let na = ra.bytes().take_while(|c| c.is_ascii_digit()).count();
+            let nb = rb.bytes().take_while(|c| c.is_ascii_digit()).count();
+            let da = &ra[..na];
+            let db = &rb[..nb];
+            let ta = da.trim_start_matches('0');
+            let tb = db.trim_start_matches('0');
+
+            match ta.len().cmp(&tb.len()).then_with(|| ta.cmp(tb)) {
+                Ordering::Equal => match da.len().cmp(&db.len()) {
+                    Ordering::Equal => {
+                        ra = &ra[na..];
+                        rb = &rb[nb..];
+                    }
+                    ord => return ord,
+                },
+                ord => return ord,
+            }
+        } else {
+            let ca = ra.chars().next().unwrap();
+            let cb = rb.chars().next().unwrap();
+            let ord = ca.to_lowercase().cmp(cb.to_lowercase());
+            if ord != Ordering::Equal {
+                return ord;
+            }
+            ra = &ra[ca.len_utf8()..];
+            rb = &rb[cb.len_utf8()..];
+        }
+    }
+
+    (!ra.is_empty())
+        .cmp(&(!rb.is_empty()))
+        .then_with(|| a.cmp(b))
+}
+
 pub fn parse_key(raw: &str) -> Result<String, String> {
     let url = raw.trim();
     let rest = url
@@ -479,7 +525,17 @@ where
         return Err("La cartella o il file MediaFire non contiene elementi scaricabili.".into());
     }
 
-    files.sort_by_key(|a| a.rel_path.to_lowercase());
+    files.sort_by(|a, b| {
+        let name_a = a
+            .rel_path
+            .rsplit_once('/')
+            .map_or(a.rel_path.as_str(), |(_, n)| n);
+        let name_b = b
+            .rel_path
+            .rsplit_once('/')
+            .map_or(b.rel_path.as_str(), |(_, n)| n);
+        cmp_natural_ci(name_a, name_b).then_with(|| cmp_natural_ci(&a.rel_path, &b.rel_path))
+    });
     Ok(files)
 }
 
@@ -750,6 +806,33 @@ mod tests {
         assert!(parse_key("https://example.com/folder/r1xp6x0i043wx").is_err());
         assert!(parse_key("http://www.mediafire.com/folder/abc").is_err());
         assert!(parse_key("https://www.mediafire.com/folder/../../bad").is_err());
+    }
+
+    #[test]
+    fn natural_sort_orders_numbers_and_case() {
+        let mut names = vec![
+            "file10.zip",
+            "File2.zip",
+            "file1.zip",
+            "alpha.txt",
+            "Beta.txt",
+        ];
+        names.sort_by(|a, b| cmp_natural_ci(a, b));
+        assert_eq!(
+            names,
+            vec![
+                "alpha.txt",
+                "Beta.txt",
+                "file1.zip",
+                "File2.zip",
+                "file10.zip"
+            ]
+        );
+        assert_eq!(
+            cmp_natural_ci("item02", "item2"),
+            std::cmp::Ordering::Greater
+        );
+        assert_eq!(cmp_natural_ci("item", "item1"), std::cmp::Ordering::Less);
     }
 
     #[test]

@@ -4,9 +4,10 @@ mod download;
 mod update_check;
 
 use download::{CancelToken, ScannedFile, Update};
+use serde::{Deserialize, Serialize};
 use slint::{CloseRequestResponse, ComponentHandle, ModelRc, SharedString, VecModel};
 use std::{
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::Command,
     sync::{Arc, Mutex},
     thread,
@@ -15,8 +16,67 @@ use update_check::{AppUpdate, CheckResult, EMBEDDED_ENGINE_VERSION, RELEASES_PAG
 
 slint::include_modules!();
 
-struct SelectableFile {
-    scanned: ScannedFile,
+#[derive(Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+struct PersistentCache {
+    last_url: String,
+}
+
+fn cache_file_path() -> PathBuf {
+    let base = std::env::var_os("LOCALAPPDATA")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
+    base.join("MediaFireMini").join("cache.json")
+}
+
+fn load_cached_url_from(path: &Path) -> Option<String> {
+    let raw = std::fs::read_to_string(path).ok()?;
+    let parsed: PersistentCache = serde_json::from_str(&raw).ok()?;
+    let trimmed = parsed.last_url.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_owned())
+    }
+}
+
+fn load_cached_url() -> Option<String> {
+    load_cached_url_from(&cache_file_path())
+}
+
+fn save_cached_url_to(path: &Path, url: &str) {
+    let trimmed = url.trim();
+    if trimmed.is_empty() {
+        return;
+    }
+    if let Some(parent) = path.parent() {
+        if std::fs::create_dir_all(parent).is_err() {
+            return;
+        }
+    }
+    let payload = PersistentCache {
+        last_url: trimmed.to_owned(),
+    };
+    let Ok(json) = serde_json::to_string_pretty(&payload) else {
+        return;
+    };
+    let tmp = path.with_extension("json.tmp");
+    if std::fs::write(&tmp, json.as_bytes()).is_ok() {
+        if std::fs::rename(&tmp, path).is_err() {
+            let _ = std::fs::write(path, json.as_bytes());
+            let _ = std::fs::remove_file(&tmp);
+        }
+    } else {
+        let _ = std::fs::write(path, json.as_bytes());
+    }
+}
+
+fn save_cached_url(url: &str) {
+    save_cached_url_to(&cache_file_path(), url);
+}
+
+struct SelectableFile<T = ScannedFile> {
+    scanned: T,
     name: String,
     rel_folder: String,
     size_text: String,
@@ -33,6 +93,7 @@ struct AppState {
     running: bool,
     checking_engine: bool,
     updating_app: bool,
+    sort_name_asc: bool,
     cancel: Option<CancelToken>,
     last_folder: Option<PathBuf>,
     engine_release_url: String,
@@ -46,6 +107,7 @@ impl Default for AppState {
             running: false,
             checking_engine: false,
             updating_app: false,
+            sort_name_asc: true,
             cancel: None,
             last_folder: None,
             engine_release_url: RELEASES_PAGE_URL.to_owned(),
@@ -98,8 +160,21 @@ fn item_matches_filter(item: &SelectableFile, filter_lower: &str) -> bool {
     filter_lower.is_empty() || item.scanned.rel_path.to_lowercase().contains(filter_lower)
 }
 
-fn sync_selector_ui(ui: &AppWindow, state: &AppState) {
-    let Some(cache) = state.scanned.as_ref() else {
+fn sort_selectable_files<T>(items: &mut [SelectableFile<T>], asc: bool) {
+    items.sort_by(|a, b| {
+        let ord = download::cmp_natural_ci(&a.name, &b.name)
+            .then_with(|| download::cmp_natural_ci(&a.rel_folder, &b.rel_folder));
+        if asc {
+            ord
+        } else {
+            ord.reverse()
+        }
+    });
+}
+
+fn sync_selector_ui_with_url(ui: &AppWindow, state: &AppState, current_url: &str) {
+    let current_trimmed = current_url.trim();
+    let Some(cache) = state.scanned.as_ref().filter(|c| c.url == current_trimmed) else {
         ui.set_has_selection(false);
         ui.set_selected_count(0);
         ui.set_total_scanned(0);
@@ -140,18 +215,18 @@ fn sync_selector_ui(ui: &AppWindow, state: &AppState) {
     ui.set_visible_files(ModelRc::new(VecModel::from(visible)));
 }
 
+fn sync_selector_ui(ui: &AppWindow, state: &AppState) {
+    let current_url = ui.get_url_text().to_string();
+    sync_selector_ui_with_url(ui, state, &current_url);
+}
+
 fn invalidate_selection_if_url_changed(
     ui: &AppWindow,
     state: &Arc<Mutex<AppState>>,
     new_url: &str,
 ) {
-    let trimmed = new_url.trim();
-    if let Ok(mut guard) = state.lock() {
-        let should_clear = guard.scanned.as_ref().is_some_and(|c| c.url != trimmed);
-        if should_clear {
-            guard.scanned = None;
-            sync_selector_ui(ui, &guard);
-        }
+    if let Ok(guard) = state.lock() {
+        sync_selector_ui_with_url(ui, &guard, new_url);
     }
 }
 
@@ -251,6 +326,9 @@ fn main() -> Result<(), slint::PlatformError> {
     ui.set_folder_text(SharedString::from(
         default_downloads_dir().to_string_lossy().as_ref(),
     ));
+    if let Some(cached_url) = load_cached_url() {
+        ui.set_url_text(SharedString::from(cached_url));
+    }
 
     let state = Arc::new(Mutex::new(AppState::default()));
 
@@ -345,21 +423,30 @@ fn main() -> Result<(), slint::PlatformError> {
         });
     }
 
-    // Paste link from clipboard
+    // Paste link from clipboard (or restore cached link if clipboard is empty)
     {
         let ui_weak = ui.as_weak();
         let state = state.clone();
         ui.on_paste_url(move || {
             let Some(ui) = ui_weak.upgrade() else { return };
-            if let Ok(mut clipboard) = arboard::Clipboard::new() {
-                if let Ok(text) = clipboard.get_text() {
-                    let trimmed = text.trim();
-                    if !trimmed.is_empty() {
-                        ui.set_url_text(SharedString::from(trimmed));
-                        ui.set_url_error(SharedString::default());
-                        ui.set_banner_error(SharedString::default());
-                        invalidate_selection_if_url_changed(&ui, &state, trimmed);
-                    }
+            let pasted = arboard::Clipboard::new()
+                .ok()
+                .and_then(|mut clipboard| clipboard.get_text().ok())
+                .map(|text| text.trim().to_owned())
+                .filter(|text| !text.is_empty());
+
+            if let Some(trimmed) = pasted {
+                ui.set_url_text(SharedString::from(&trimmed));
+                ui.set_url_error(SharedString::default());
+                ui.set_banner_error(SharedString::default());
+                save_cached_url(&trimmed);
+                invalidate_selection_if_url_changed(&ui, &state, &trimmed);
+            } else if ui.get_url_text().as_str().trim().is_empty() {
+                if let Some(cached) = load_cached_url() {
+                    ui.set_url_text(SharedString::from(&cached));
+                    ui.set_url_error(SharedString::default());
+                    ui.set_banner_error(SharedString::default());
+                    invalidate_selection_if_url_changed(&ui, &state, &cached);
                 }
             }
         });
@@ -377,14 +464,19 @@ fn main() -> Result<(), slint::PlatformError> {
         });
     }
 
-    // Track URL edits to clear stale selection
+    // Track URL edits to update selection visibility and cache valid MediaFire links
     {
         let ui_weak = ui.as_weak();
         let state = state.clone();
         ui.on_url_edited(move |txt| {
             let Some(ui) = ui_weak.upgrade() else { return };
             ui.set_url_error(SharedString::default());
-            invalidate_selection_if_url_changed(&ui, &state, txt.as_str());
+            let raw = txt.to_string();
+            let trimmed = raw.trim();
+            if download::parse_key(trimmed).is_ok() {
+                save_cached_url(trimmed);
+            }
+            invalidate_selection_if_url_changed(&ui, &state, &raw);
         });
     }
 
@@ -463,6 +555,7 @@ fn main() -> Result<(), slint::PlatformError> {
                 ui.set_url_error(SharedString::from(err));
                 return;
             }
+            save_cached_url(&url);
 
             // If already scanned for this exact URL, open the selector immediately.
             if let Ok(guard) = state.lock() {
@@ -546,9 +639,28 @@ fn main() -> Result<(), slint::PlatformError> {
             let Some(ui) = ui_weak.upgrade() else { return };
             if let Ok(mut guard) = state.lock() {
                 if let Some(cache) = guard.scanned.as_mut() {
-                    if let Some(item) = cache.items.get_mut(id as usize) {
-                        item.checked = !item.checked;
+                    if let Ok(idx) = usize::try_from(id) {
+                        if let Some(item) = cache.items.get_mut(idx) {
+                            item.checked = !item.checked;
+                        }
                     }
+                }
+                sync_selector_ui(&ui, &guard);
+            }
+        });
+    }
+
+    {
+        let ui_weak = ui.as_weak();
+        let state = state.clone();
+        ui.on_toggle_sort_by_name(move || {
+            let Some(ui) = ui_weak.upgrade() else { return };
+            if let Ok(mut guard) = state.lock() {
+                guard.sort_name_asc = !guard.sort_name_asc;
+                let asc = guard.sort_name_asc;
+                ui.set_sort_name_asc(asc);
+                if let Some(cache) = guard.scanned.as_mut() {
+                    sort_selectable_files(&mut cache.items, asc);
                 }
                 sync_selector_ui(&ui, &guard);
             }
@@ -656,6 +768,7 @@ fn trigger_download(ui: &AppWindow, state: &Arc<Mutex<AppState>>) {
         ui.set_url_error(SharedString::from(err));
         return;
     }
+    save_cached_url(&url);
 
     let output = PathBuf::from(&folder_str);
     if !output.is_dir() {
@@ -750,7 +863,7 @@ fn handle_update(
         }
         Update::ScanReady { key, files } => {
             let total = files.len();
-            let items: Vec<SelectableFile> = files
+            let mut items: Vec<SelectableFile> = files
                 .into_iter()
                 .map(|scanned| {
                     let (name, rel_folder) = split_rel_path(&scanned.rel_path);
@@ -764,23 +877,24 @@ fn handle_update(
                     }
                 })
                 .collect();
+            sort_selectable_files(&mut items, true);
 
-            if let Ok(mut cur) = state.lock() {
-                cur.running = false;
-                cur.cancel = None;
-                cur.scanned = Some(ScannedCache {
-                    url: scanned_url.unwrap_or_default().to_owned(),
-                    key,
-                    items,
-                });
-                sync_selector_ui(ui, &cur);
-            }
             ui.set_is_running(false);
             ui.set_is_indeterminate(false);
             ui.set_is_cancelling(false);
             ui.set_progress_value(0.0);
             ui.set_filter_text(SharedString::default());
-            if let Ok(cur) = state.lock() {
+            ui.set_sort_name_asc(true);
+
+            if let Ok(mut cur) = state.lock() {
+                cur.running = false;
+                cur.cancel = None;
+                cur.sort_name_asc = true;
+                cur.scanned = Some(ScannedCache {
+                    url: scanned_url.unwrap_or_default().to_owned(),
+                    key,
+                    items,
+                });
                 sync_selector_ui(ui, &cur);
             }
             ui.set_status_title(SharedString::from("Elenco pronto"));
@@ -907,5 +1021,86 @@ fn handle_update(
             ));
             ui.set_banner_error(SharedString::from(err));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_item(name: &str, rel_folder: &str, checked: bool) -> SelectableFile<()> {
+        SelectableFile {
+            scanned: (),
+            name: name.to_owned(),
+            rel_folder: rel_folder.to_owned(),
+            size_text: "1 KiB".to_owned(),
+            checked,
+        }
+    }
+
+    #[test]
+    fn sorts_selectable_files_az_and_za_preserving_checked_state() {
+        let mut items = vec![
+            test_item("part10.zip", "", false),
+            test_item("Beta.txt", "sub", true),
+            test_item("part2.zip", "", true),
+            test_item("alpha.txt", "z_dir", false),
+            test_item("alpha.txt", "a_dir", true),
+        ];
+
+        sort_selectable_files(&mut items, true);
+        let asc_view: Vec<(&str, &str, bool)> = items
+            .iter()
+            .map(|i| (i.name.as_str(), i.rel_folder.as_str(), i.checked))
+            .collect();
+        assert_eq!(
+            asc_view,
+            vec![
+                ("alpha.txt", "a_dir", true),
+                ("alpha.txt", "z_dir", false),
+                ("Beta.txt", "sub", true),
+                ("part2.zip", "", true),
+                ("part10.zip", "", false),
+            ]
+        );
+
+        sort_selectable_files(&mut items, false);
+        let desc_view: Vec<(&str, &str, bool)> = items
+            .iter()
+            .map(|i| (i.name.as_str(), i.rel_folder.as_str(), i.checked))
+            .collect();
+        assert_eq!(
+            desc_view,
+            vec![
+                ("part10.zip", "", false),
+                ("part2.zip", "", true),
+                ("Beta.txt", "sub", true),
+                ("alpha.txt", "z_dir", false),
+                ("alpha.txt", "a_dir", true),
+            ]
+        );
+    }
+
+    #[test]
+    fn persistent_cache_roundtrip_and_ignores_empty() {
+        let dir =
+            std::env::temp_dir().join(format!("mediafire-mini-cache-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("cache.json");
+
+        assert_eq!(load_cached_url_from(&path), None);
+
+        save_cached_url_to(&path, "   ");
+        assert!(!path.exists());
+
+        let url = "https://www.mediafire.com/folder/r1xp6x0i043wx/Test";
+        save_cached_url_to(&path, &format!("  {url}  "));
+        assert_eq!(load_cached_url_from(&path), Some(url.to_owned()));
+
+        let url2 = "https://www.mediafire.com/file/abc123/example.zip";
+        save_cached_url_to(&path, url2);
+        assert_eq!(load_cached_url_from(&path), Some(url2.to_owned()));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -54,7 +54,7 @@ export component AppWindow inherits MaterialWindow {
     in property <string> status_detail: "Incolla un link MediaFire HTTPS per scaricare la cartella o il file.";
     in property <string> progress_summary: "";
     in property <string> banner_error: "";
-    in property <string> app_version: "v0.3.0";
+    in property <string> app_version: "v0.3.2";
 
     // Update check & single-EXE self-update state
     in property <bool> is_checking_engine: false;
@@ -67,6 +67,7 @@ export component AppWindow inherits MaterialWindow {
     // File selector state
     in-out property <bool> selector_open: false;
     in-out property <string> filter_text: "";
+    in-out property <bool> sort_name_asc: true;
     in property <[FileEntry]> visible_files: [];
     in property <bool> has_selection: false;
     in property <int> selected_count: 0;
@@ -93,6 +94,7 @@ export component AppWindow inherits MaterialWindow {
     callback toggle_file(id: int);
     callback select_all_visible();
     callback deselect_all_visible();
+    callback toggle_sort_by_name();
     callback start_selected_download();
 
     public function show_busy_dialog() {
@@ -562,39 +564,45 @@ export component AppWindow inherits MaterialWindow {
             }
         }
 
-        // Filter & Select All/None Bar
+        // Filter Bar
+        TextField {
+            vertical-stretch: 0;
+            label: "Filtra per nome o cartella...";
+            text <=> root.filter_text;
+
+            edited(txt) => {
+                root.filter_changed(txt);
+            }
+        }
+
+        // Select All / Deselect All & Sort Toolbar
         HorizontalLayout {
             spacing: MaterialStyleMetrics.spacing_8;
             vertical-stretch: 0;
 
-            TextField {
-                horizontal-stretch: 1;
-                label: "Filtra per nome o cartella...";
-                text <=> root.filter_text;
-
-                edited(txt) => {
-                    root.filter_changed(txt);
-                }
+            OutlineButton {
+                horizontal-stretch: 0;
+                text: "Seleziona tutto";
+                enabled: root.visible_files.length > 0;
+                clicked => { root.select_all_visible(); }
             }
 
-            VerticalLayout {
+            OutlineButton {
                 horizontal-stretch: 0;
-                padding_top: 8px;
-                alignment: start;
+                text: "Deseleziona tutto";
+                enabled: root.visible_files.length > 0;
+                clicked => { root.deselect_all_visible(); }
+            }
 
-                HorizontalLayout {
-                    spacing: MaterialStyleMetrics.spacing_8;
+            Rectangle {
+                horizontal-stretch: 1;
+            }
 
-                    OutlineButton {
-                        text: "Tutti";
-                        clicked => { root.select_all_visible(); }
-                    }
-
-                    OutlineButton {
-                        text: "Nessuno";
-                        clicked => { root.deselect_all_visible(); }
-                    }
-                }
+            TonalButton {
+                horizontal-stretch: 0;
+                text: root.sort_name_asc ? "Ordina per nome (A-Z)" : "Ordina per nome (Z-A)";
+                enabled: root.visible_files.length > 1;
+                clicked => { root.toggle_sort_by_name(); }
             }
         }
 
