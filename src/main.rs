@@ -318,6 +318,7 @@ fn spawn_engine_check(ui_weak: slint::Weak<AppWindow>, state: Arc<Mutex<AppState
 }
 
 fn main() -> Result<(), slint::PlatformError> {
+    update_check::finish_self_update();
     let ui = AppWindow::new()?;
     ui.set_app_version(SharedString::from(format!(
         "v{}",
@@ -397,9 +398,7 @@ fn main() -> Result<(), slint::PlatformError> {
                         }
                         Err(err) => {
                             ui.set_status_title(SharedString::from("Aggiornamento non riuscito"));
-                            ui.set_status_detail(SharedString::from(
-                                "Il file attuale non è stato modificato.",
-                            ));
+                            ui.set_status_detail(SharedString::default());
                             ui.set_banner_error(SharedString::from(err));
                         }
                     }

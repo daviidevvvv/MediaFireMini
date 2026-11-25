@@ -1,11 +1,11 @@
 use ring::digest::{Context, SHA256};
 use serde::Deserialize;
 use std::{
-    fs::File,
-    io::Write,
-    os::windows::process::CommandExt,
-    path::PathBuf,
-    process::{Command, Stdio},
+    fs::{self, File},
+    io::{self, Write},
+    path::{Path, PathBuf},
+    process::Command,
+    thread,
     time::Duration,
 };
 
@@ -15,7 +15,7 @@ const MDRS_REPO: &str = "NicKoehler/mediafire_rs";
 const APP_ASSET_NAME: &str = "MediaFireMini.exe";
 pub const RELEASES_PAGE_URL: &str = "https://github.com/NicKoehler/mediafire_rs/releases/latest";
 const MAX_ASSET_BYTES: u64 = 80 * 1024 * 1024;
-const CREATE_NO_WINDOW: u32 = 0x08000000;
+const FINISH_UPDATE_ARG: &str = "--finish-self-update";
 
 #[derive(Debug, Clone)]
 pub struct AppUpdate {
@@ -226,8 +226,7 @@ fn sha256_hex(bytes: &[u8]) -> String {
     out
 }
 
-/// Downloads, SHA256-verifies, stages in %TEMP%, and launches an in-memory cmd.exe
-/// replacer so the single standalone EXE replaces itself and restarts cleanly.
+/// Downloads and verifies the replacement before swapping executables and restarting.
 pub fn download_and_launch_self_update(update: &AppUpdate) -> Result<(), String> {
     let expected_prefix = format!("https://github.com/{APP_REPO}/releases/download/");
     if !update.download_url.starts_with(&expected_prefix)
@@ -237,10 +236,6 @@ pub fn download_and_launch_self_update(update: &AppUpdate) -> Result<(), String>
     }
 
     let current_exe = std::env::current_exe().map_err(|e| format!("Percorso EXE: {e}"))?;
-    let current_str = current_exe.to_string_lossy().into_owned();
-    if current_str.contains('"') || current_str.contains('\n') || current_str.contains('\r') {
-        return Err("Percorso eseguibile non supportato per auto-aggiornamento.".into());
-    }
 
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -269,7 +264,7 @@ pub fn download_and_launch_self_update(update: &AppUpdate) -> Result<(), String>
         if data.len() as u64 != update.size || data.len() as u64 > MAX_ASSET_BYTES {
             return Err("Dimensione scaricata non corrispondente.".into());
         }
-        Ok(data.to_vec())
+        Ok(data)
     })?;
 
     if bytes.len() < 8192 || !bytes.starts_with(b"MZ") {
@@ -281,41 +276,85 @@ pub fn download_and_launch_self_update(update: &AppUpdate) -> Result<(), String>
         return Err("SHA256 NON CORRISPONDE: aggiornamento bloccato per sicurezza.".into());
     }
 
-    let staged: PathBuf =
-        std::env::temp_dir().join(format!("MediaFireMini.update.{}.exe", std::process::id()));
-    {
-        let mut file = File::create(&staged).map_err(|e| format!("Scrittura staging: {e}"))?;
-        file.write_all(&bytes)
-            .map_err(|e| format!("Scrittura staging: {e}"))?;
-        file.sync_all().map_err(|e| format!("Flush staging: {e}"))?;
+    install_verified_update(&current_exe, &bytes, |exe| {
+        Command::new(exe).arg(FINISH_UPDATE_ARG).spawn().map(|_| ())
+    })
+}
+
+fn update_dir(exe: &Path) -> PathBuf {
+    let mut dir = exe.as_os_str().to_owned();
+    dir.push(".update");
+    PathBuf::from(dir)
+}
+
+fn install_verified_update(
+    exe: &Path,
+    bytes: &[u8],
+    restart: impl FnOnce(&Path) -> io::Result<()>,
+) -> Result<(), String> {
+    // Use the same volume for both renames. create_dir reserves this location
+    // for one updater even when several instances are open.
+    let dir = update_dir(exe);
+    fs::create_dir(&dir)
+        .map_err(|e| format!("Preparazione aggiornamento in {}: {e}", dir.display()))?;
+    let staged = dir.join("new.exe");
+    let backup = dir.join("previous.exe");
+
+    let result = (|| {
+        let mut file = File::create_new(&staged)
+            .map_err(|e| format!("Creazione del nuovo eseguibile: {e}"))?;
+        file.write_all(bytes)
+            .and_then(|()| file.sync_all())
+            .map_err(|e| format!("Salvataggio del nuovo eseguibile: {e}"))?;
+        drop(file);
+
+        // Windows allows renaming the running image while keeping it mapped.
+        // The old instance can therefore report errors before closing.
+        fs::rename(exe, &backup)
+            .map_err(|e| format!("Spostamento dell'eseguibile attuale: {e}"))?;
+        if let Err(error) = fs::rename(&staged, exe).and_then(|()| restart(exe)) {
+            if let Err(restore_error) = fs::rename(&backup, exe) {
+                return Err(format!(
+                    "Installazione fallita: {error}. Ripristino fallito: {restore_error}. Copia precedente: {}",
+                    backup.display()
+                ));
+            }
+            return Err(format!(
+                "Installazione fallita: {error}. Versione precedente ripristinata."
+            ));
+        }
+        Ok(())
+    })();
+
+    if result.is_err() && !backup.exists() {
+        let _ = fs::remove_file(&staged);
+        let _ = fs::remove_dir(&dir);
     }
+    result
+}
 
-    // Use environment variables inside cmd.exe to avoid path escaping/injection issues.
-    // Retries move /Y up to 20 times until the exiting process releases its file lock,
-    // then starts the updated single EXE without leaving extra files on the Desktop.
-    let cmd_script = concat!(
-        "for /L %i in (1,1,20) do (",
-        "move /Y \"%MF_SRC%\" \"%MF_DST%\" >nul 2>&1 ",
-        "&& (start \"\" \"%MF_DST%\" & exit /b 0) ",
-        "|| ping -n 2 127.0.0.1 >nul",
-        ")"
-    );
-
-    Command::new("cmd.exe")
-        .args(["/C", cmd_script])
-        .env("MF_SRC", &staged)
-        .env("MF_DST", &current_exe)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .creation_flags(CREATE_NO_WINDOW)
-        .spawn()
-        .map_err(|e| {
-            let _ = std::fs::remove_file(&staged);
-            format!("Avvio sostituzione fallito: {e}")
-        })?;
-
-    Ok(())
+pub fn finish_self_update() {
+    if std::env::args_os().nth(1).as_deref() != Some(FINISH_UPDATE_ARG.as_ref()) {
+        return;
+    }
+    let Ok(exe) = std::env::current_exe() else {
+        return;
+    };
+    let dir = update_dir(&exe);
+    let backup = dir.join("previous.exe");
+    // The new process can start just before the original image is unmapped.
+    thread::spawn(move || {
+        for _ in 0..100 {
+            match fs::remove_file(&backup) {
+                Ok(()) => {
+                    let _ = fs::remove_dir(&dir);
+                    break;
+                }
+                Err(e) if e.kind() == io::ErrorKind::NotFound => break,
+                Err(_) => thread::sleep(Duration::from_millis(100)),
+            }
+        }
+    });
 }
 
 #[cfg(test)]
@@ -344,5 +383,29 @@ mod tests {
         assert!(normalized_sha256(None).is_err());
         assert!(normalized_sha256(Some("sha256:xyz")).is_err());
         assert!(normalized_sha256(Some(&format!("sha256:{}", "a".repeat(64)))).is_ok());
+    }
+
+    #[test]
+    fn restores_previous_executable_when_relaunch_fails() {
+        let dir =
+            std::env::temp_dir().join(format!("mediafire-mini-update-test-{}", std::process::id()));
+        fs::create_dir(&dir).unwrap();
+        let exe = dir.join("MediaFire Mini & avanzamento 100%.exe");
+        fs::write(&exe, b"previous executable").unwrap();
+
+        let result = install_verified_update(&exe, b"new executable", |installed| {
+            assert_eq!(fs::read(installed)?, b"new executable");
+            Err(io::Error::other("simulated launch failure"))
+        });
+        let restored = fs::read(&exe);
+        let discarded_staging = !update_dir(&exe).exists();
+        fs::remove_file(exe).unwrap();
+        fs::remove_dir(dir).unwrap();
+
+        assert!(result
+            .unwrap_err()
+            .contains("Versione precedente ripristinata"));
+        assert_eq!(restored.unwrap(), b"previous executable");
+        assert!(discarded_staging);
     }
 }
