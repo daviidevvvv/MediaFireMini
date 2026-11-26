@@ -4,6 +4,7 @@ import {
     MaterialTypography,
     MaterialStyleMetrics,
     MaterialText,
+    Icon,
     OutlinedCard,
     FilledCard,
     TextField,
@@ -22,12 +23,24 @@ import {
 
 export { MaterialWindowAdapter } from "@material";
 
-export struct FileEntry {
+export enum SelectorAction {
+    toggle-row,
+    open-folder,
+    go-up,
+    toggle-selected-only,
+    select-visible,
+    deselect-visible,
+    toggle-sort,
+}
+
+export struct SelectorEntry {
     id: int,
     name: string,
-    rel_folder: string,
+    path: string,
+    detail: string,
     size_text: string,
     checked: bool,
+    partial: bool,
 }
 
 export component AppWindow inherits MaterialWindow {
@@ -54,7 +67,7 @@ export component AppWindow inherits MaterialWindow {
     in property <string> status_detail: "Incolla un link MediaFire HTTPS per scaricare la cartella o il file.";
     in property <string> progress_summary: "";
     in property <string> banner_error: "";
-    in property <string> app_version: "v0.3.2";
+    in property <string> app_version;
 
     // Update check & single-EXE self-update state
     in property <bool> is_checking_engine: false;
@@ -68,7 +81,10 @@ export component AppWindow inherits MaterialWindow {
     in-out property <bool> selector_open: false;
     in-out property <string> filter_text: "";
     in-out property <bool> sort_name_asc: true;
-    in property <[FileEntry]> visible_files: [];
+    in property <[SelectorEntry]> selector_entries: [];
+    in property <string> selector_path;
+    in property <bool> selector_can_go_up;
+    in property <bool> selector_selected_only;
     in property <bool> has_selection: false;
     in property <int> selected_count: 0;
     in property <int> total_scanned: 0;
@@ -91,10 +107,7 @@ export component AppWindow inherits MaterialWindow {
     callback close_selector();
     callback reset_selection();
     callback filter_changed(text: string);
-    callback toggle_file(id: int);
-    callback select_all_visible();
-    callback deselect_all_visible();
-    callback toggle_sort_by_name();
+    callback manage_selector(action: SelectorAction, id: int, path: string);
     callback start_selected_download();
 
     public function show_busy_dialog() {
@@ -558,9 +571,13 @@ export component AppWindow inherits MaterialWindow {
                 }
             }
 
-            TextButton {
-                text: "Indietro";
-                clicked => { root.close_selector(); }
+            TonalButton {
+                text: root.selector_selected_only ? "Tutte le cartelle" : "Solo selezionati";
+                enabled: root.selector_selected_only || root.selected_count > 0;
+                clicked => {
+                    root.manage_selector(SelectorAction.toggle-selected-only, -1, "");
+                    selector_scroll.viewport_y = 0px;
+                }
             }
         }
 
@@ -572,6 +589,7 @@ export component AppWindow inherits MaterialWindow {
 
             edited(txt) => {
                 root.filter_changed(txt);
+                selector_scroll.viewport_y = 0px;
             }
         }
 
@@ -583,15 +601,15 @@ export component AppWindow inherits MaterialWindow {
             OutlineButton {
                 horizontal-stretch: 0;
                 text: "Seleziona tutto";
-                enabled: root.visible_files.length > 0;
-                clicked => { root.select_all_visible(); }
+                enabled: !root.selector_selected_only && root.selector_entries.length > 0;
+                clicked => { root.manage_selector(SelectorAction.select-visible, -1, ""); }
             }
 
             OutlineButton {
                 horizontal-stretch: 0;
                 text: "Deseleziona tutto";
-                enabled: root.visible_files.length > 0;
-                clicked => { root.deselect_all_visible(); }
+                enabled: root.selector_entries.length > 0;
+                clicked => { root.manage_selector(SelectorAction.deselect-visible, -1, ""); }
             }
 
             Rectangle {
@@ -600,9 +618,36 @@ export component AppWindow inherits MaterialWindow {
 
             TonalButton {
                 horizontal-stretch: 0;
-                text: root.sort_name_asc ? "Ordina per nome (A-Z)" : "Ordina per nome (Z-A)";
-                enabled: root.visible_files.length > 1;
-                clicked => { root.toggle_sort_by_name(); }
+                text: root.sort_name_asc ? "Ordine A–Z" : "Ordine Z–A";
+                accessible-description: "Mostra prima i selezionati e cambia l'ordine alfabetico.";
+                clicked => {
+                    root.manage_selector(SelectorAction.toggle-sort, -1, "");
+                    selector_scroll.viewport_y = 0px;
+                }
+            }
+        }
+
+        if !root.selector_selected_only : HorizontalLayout {
+            spacing: MaterialStyleMetrics.spacing_8;
+            vertical-stretch: 0;
+            min-height: 40px;
+
+            if root.selector_can_go_up : TextButton {
+                text: "Cartella superiore";
+                clicked => {
+                    root.manage_selector(SelectorAction.go-up, -1, "");
+                    selector_scroll.viewport_y = 0px;
+                }
+            }
+
+            MaterialText {
+                horizontal-stretch: 1;
+                text: root.selector_path;
+                accessible-label: root.selector_path;
+                style: MaterialTypography.title_small;
+                color: MaterialPalette.on_surface;
+                vertical_alignment: center;
+                overflow: elide;
             }
         }
 
@@ -610,7 +655,7 @@ export component AppWindow inherits MaterialWindow {
         OutlinedCard {
             vertical-stretch: 1;
 
-            ScrollView {
+            selector_scroll := ScrollView {
                 horizontal_scrollbar_policy: ScrollBarPolicy.always_off;
 
                 VerticalLayout {
@@ -619,11 +664,13 @@ export component AppWindow inherits MaterialWindow {
                     spacing: 2px;
                     alignment: start;
 
-                    if root.visible_files.length == 0 : Rectangle {
+                    if root.selector_entries.length == 0 : Rectangle {
                         min-height: 120px;
 
                         MaterialText {
-                            text: "Nessun file corrisponde al filtro.";
+                            text: root.filter_text != "" ? "Nessun risultato per questo filtro."
+                                : root.selector_selected_only ? "Nessun file selezionato."
+                                : "Questa cartella non contiene file scaricabili.";
                             style: MaterialTypography.body_medium;
                             color: MaterialPalette.on_surface_variant;
                             horizontal_alignment: center;
@@ -631,12 +678,12 @@ export component AppWindow inherits MaterialWindow {
                         }
                     }
 
-                    for item in root.visible_files : Rectangle {
+                    for item in root.selector_entries : Rectangle {
+                        property <CheckState> displayed_state: item.checked ? CheckState.checked
+                            : item.partial ? CheckState.partially-checked : CheckState.unchecked;
                         min-height: 52px;
                         border_radius: MaterialStyleMetrics.border_radius_8;
-                        background: row_touch.has_hover
-                            ? MaterialPalette.surface_container_high
-                            : (item.checked ? MaterialPalette.surface_container_low : transparent);
+                        background: item.checked || item.partial ? MaterialPalette.surface_container_low : transparent;
 
                         HorizontalLayout {
                             padding_left: MaterialStyleMetrics.padding_4;
@@ -645,14 +692,24 @@ export component AppWindow inherits MaterialWindow {
                             padding_bottom: MaterialStyleMetrics.padding_4;
                             spacing: MaterialStyleMetrics.spacing_8;
 
-                            Rectangle {
+                            CheckBox {
                                 horizontal-stretch: 0;
-                                width: 48px;
-                                height: 48px;
-
-                                CheckBox {
-                                    check_state: item.checked ? CheckState.checked : CheckState.unchecked;
+                                check_state: displayed_state;
+                                accessible-label: item.id < 0 ? item.name + ", " + item.detail : item.name;
+                                checked_state_changed(value) => {
+                                    if value != displayed_state {
+                                        root.manage_selector(SelectorAction.toggle-row, item.id, item.path);
+                                    }
                                 }
+                            }
+
+                            if item.id < 0 : Icon {
+                                source: @image-url("assets/folder.svg");
+                                colorize: MaterialPalette.primary;
+                                width: MaterialStyleMetrics.icon_size_24;
+                                height: self.width;
+                                horizontal-stretch: 0;
+                                accessible-role: none;
                             }
 
                             VerticalLayout {
@@ -662,20 +719,30 @@ export component AppWindow inherits MaterialWindow {
 
                                 MaterialText {
                                     text: item.name;
-                                    style: MaterialTypography.body_medium;
+                                    style: item.id < 0 ? MaterialTypography.title_small : MaterialTypography.body_medium;
                                     color: MaterialPalette.on_surface;
                                     overflow: elide;
                                 }
 
-                                if item.rel_folder != "" : MaterialText {
-                                    text: item.rel_folder;
+                                if item.detail != "" : MaterialText {
+                                    text: item.detail;
                                     style: MaterialTypography.body_small;
                                     color: MaterialPalette.on_surface_variant;
                                     overflow: elide;
                                 }
                             }
 
-                            MaterialText {
+                            if item.id < 0 : TextButton {
+                                horizontal-stretch: 0;
+                                text: "Apri";
+                                accessible-label: "Apri cartella " + item.name;
+                                clicked => {
+                                    root.manage_selector(SelectorAction.open-folder, -1, item.path);
+                                    selector_scroll.viewport_y = 0px;
+                                }
+                            }
+
+                            if item.id >= 0 : MaterialText {
                                 horizontal-stretch: 0;
                                 text: item.size_text;
                                 style: MaterialTypography.label_medium;
@@ -684,11 +751,6 @@ export component AppWindow inherits MaterialWindow {
                             }
                         }
 
-                        row_touch := TouchArea {
-                            clicked => {
-                                root.toggle_file(item.id);
-                            }
-                        }
                     }
                 }
             }

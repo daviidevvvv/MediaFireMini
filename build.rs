@@ -1,6 +1,7 @@
 fn main() {
     println!("cargo:rerun-if-changed=ui/app.slint");
     println!("cargo:rerun-if-changed=ui/assets/logo.png");
+    println!("cargo:rerun-if-changed=ui/assets/folder.svg");
     println!("cargo:rerun-if-changed=assets/app.ico");
 
     let manifest_dir = std::env::var_os("CARGO_MANIFEST_DIR").unwrap();

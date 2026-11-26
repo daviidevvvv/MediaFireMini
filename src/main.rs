@@ -1,15 +1,18 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod download;
+mod selector;
 mod update_check;
 
-use download::{CancelToken, ScannedFile, Update};
+use download::{CancelToken, Update};
+use selector::{SelectableFile, Selection};
 use serde::{Deserialize, Serialize};
 use slint::{CloseRequestResponse, ComponentHandle, ModelRc, SharedString, VecModel};
 use std::{
+    io,
     path::{Path, PathBuf},
     process::Command,
-    sync::{Arc, Mutex},
+    sync::{mpsc, Arc, Mutex},
     thread,
 };
 use update_check::{AppUpdate, CheckResult, EMBEDDED_ENGINE_VERSION, RELEASES_PAGE_URL};
@@ -33,60 +36,89 @@ fn load_cached_url_from(path: &Path) -> Option<String> {
     let raw = std::fs::read_to_string(path).ok()?;
     let parsed: PersistentCache = serde_json::from_str(&raw).ok()?;
     let trimmed = parsed.last_url.trim();
-    if trimmed.is_empty() {
-        None
-    } else {
-        Some(trimmed.to_owned())
-    }
+    download::parse_key(trimmed).ok()?;
+    Some(trimmed.to_owned())
 }
 
-fn load_cached_url() -> Option<String> {
-    load_cached_url_from(&cache_file_path())
-}
-
-fn save_cached_url_to(path: &Path, url: &str) {
+fn save_cached_url_to(path: &Path, url: &str) -> io::Result<()> {
     let trimmed = url.trim();
-    if trimmed.is_empty() {
-        return;
+    if download::parse_key(trimmed).is_err() {
+        return Ok(());
     }
     if let Some(parent) = path.parent() {
-        if std::fs::create_dir_all(parent).is_err() {
-            return;
-        }
+        std::fs::create_dir_all(parent)?;
     }
     let payload = PersistentCache {
         last_url: trimmed.to_owned(),
     };
-    let Ok(json) = serde_json::to_string_pretty(&payload) else {
-        return;
-    };
-    let tmp = path.with_extension("json.tmp");
-    if std::fs::write(&tmp, json.as_bytes()).is_ok() {
-        if std::fs::rename(&tmp, path).is_err() {
-            let _ = std::fs::write(path, json.as_bytes());
-            let _ = std::fs::remove_file(&tmp);
+    let json = serde_json::to_vec(&payload)?;
+    let tmp = path.with_extension(format!("{}.tmp", std::process::id()));
+    let result = std::fs::write(&tmp, json).and_then(|()| std::fs::rename(&tmp, path));
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result
+}
+
+#[derive(Clone)]
+struct LastLink {
+    pending: Arc<Mutex<Option<String>>>,
+    wake: mpsc::SyncSender<()>,
+}
+
+impl LastLink {
+    fn remember(&self, url: &str) {
+        let url = url.trim();
+        if download::parse_key(url).is_ok() {
+            if let Ok(mut pending) = self.pending.lock() {
+                *pending = Some(url.to_owned());
+                let _ = self.wake.try_send(());
+            }
         }
-    } else {
-        let _ = std::fs::write(path, json.as_bytes());
     }
 }
 
-fn save_cached_url(url: &str) {
-    save_cached_url_to(&cache_file_path(), url);
-}
-
-struct SelectableFile<T = ScannedFile> {
-    scanned: T,
-    name: String,
-    rel_folder: String,
-    size_text: String,
-    checked: bool,
+fn start_link_writer(
+    path: PathBuf,
+    mut saved: Option<String>,
+    ui: slint::Weak<AppWindow>,
+) -> (LastLink, thread::JoinHandle<()>) {
+    let (wake, requests) = mpsc::sync_channel(1);
+    let pending = Arc::new(Mutex::new(None::<String>));
+    let worker_pending = pending.clone();
+    let worker = thread::spawn(move || {
+        // Keep only the latest valid edit when input changes faster than disk writes.
+        for () in requests {
+            let url = worker_pending
+                .lock()
+                .ok()
+                .and_then(|mut pending| pending.take());
+            let Some(url) = url else { continue };
+            if saved.as_deref() == Some(&url) {
+                continue;
+            }
+            match save_cached_url_to(&path, &url) {
+                Ok(()) => saved = Some(url),
+                Err(err) => {
+                    let ui = ui.clone();
+                    let _ = slint::invoke_from_event_loop(move || {
+                        if let Some(ui) = ui.upgrade() {
+                            ui.set_banner_error(SharedString::from(format!(
+                                "Impossibile ricordare l'ultimo link: {err}"
+                            )));
+                        }
+                    });
+                }
+            }
+        }
+    });
+    (LastLink { pending, wake }, worker)
 }
 
 struct ScannedCache {
     url: String,
     key: String,
-    items: Vec<SelectableFile>,
+    selection: Selection,
 }
 
 struct AppState {
@@ -149,27 +181,8 @@ fn format_mib(bytes: u64) -> String {
     format!("{:.1} MiB", bytes as f64 / 1_048_576.0)
 }
 
-fn split_rel_path(rel_path: &str) -> (String, String) {
-    match rel_path.rsplit_once('/') {
-        Some((dir, name)) => (name.to_owned(), dir.to_owned()),
-        None => (rel_path.to_owned(), String::new()),
-    }
-}
-
-fn item_matches_filter(item: &SelectableFile, filter_lower: &str) -> bool {
-    filter_lower.is_empty() || item.scanned.rel_path.to_lowercase().contains(filter_lower)
-}
-
-fn sort_selectable_files<T>(items: &mut [SelectableFile<T>], asc: bool) {
-    items.sort_by(|a, b| {
-        let ord = download::cmp_natural_ci(&a.name, &b.name)
-            .then_with(|| download::cmp_natural_ci(&a.rel_folder, &b.rel_folder));
-        if asc {
-            ord
-        } else {
-            ord.reverse()
-        }
-    });
+fn filter(ui: &AppWindow) -> String {
+    ui.get_filter_text().as_str().trim().to_lowercase()
 }
 
 fn sync_selector_ui_with_url(ui: &AppWindow, state: &AppState, current_url: &str) {
@@ -179,32 +192,60 @@ fn sync_selector_ui_with_url(ui: &AppWindow, state: &AppState, current_url: &str
         ui.set_selected_count(0);
         ui.set_total_scanned(0);
         ui.set_selection_summary(SharedString::default());
-        ui.set_visible_files(ModelRc::new(VecModel::from(Vec::<FileEntry>::new())));
+        ui.set_selector_entries(ModelRc::new(VecModel::from(Vec::<SelectorEntry>::new())));
         return;
     };
 
-    let filter_lower = ui.get_filter_text().to_string().trim().to_lowercase();
-    let mut visible = Vec::new();
-    let mut selected_count = 0i32;
-    let mut selected_bytes = 0u64;
-
-    for (idx, item) in cache.items.iter().enumerate() {
-        if item.checked {
-            selected_count += 1;
-            selected_bytes = selected_bytes.saturating_add(item.scanned.job.size);
-        }
-        if item_matches_filter(item, &filter_lower) {
-            visible.push(FileEntry {
-                id: idx as i32,
-                name: SharedString::from(&item.name),
-                rel_folder: SharedString::from(&item.rel_folder),
-                size_text: SharedString::from(&item.size_text),
-                checked: item.checked,
-            });
-        }
-    }
-
-    let total = cache.items.len() as i32;
+    let selection = &cache.selection;
+    let visible = selection
+        .rows(&filter(ui), state.sort_name_asc)
+        .into_iter()
+        .map(|row| {
+            let (id, detail, size_text) = match row.file_index {
+                Some(index) => (
+                    index as i32,
+                    if selection.selected_only {
+                        row.path
+                            .rsplit_once('/')
+                            .map_or("", |(folder, _)| folder)
+                            .to_owned()
+                    } else {
+                        String::new()
+                    },
+                    format_size(selection.items[index].scanned.job.size),
+                ),
+                None => (
+                    -1,
+                    format!("Cartella · {} di {} file", row.selected, row.total),
+                    String::new(),
+                ),
+            };
+            SelectorEntry {
+                id,
+                name: SharedString::from(row.name),
+                path: SharedString::from(row.path),
+                detail: SharedString::from(detail),
+                size_text: SharedString::from(size_text),
+                checked: row.selected == row.total,
+                partial: row.selected > 0 && row.selected < row.total,
+            }
+        })
+        .collect::<Vec<_>>();
+    let (selected_count, selected_bytes) = selection
+        .items
+        .iter()
+        .filter(|item| item.checked)
+        .fold((0i32, 0u64), |(count, bytes), item| {
+            (count + 1, bytes.saturating_add(item.scanned.job.size))
+        });
+    let total = selection.items.len() as i32;
+    ui.set_selector_path(SharedString::from(if selection.folder.is_empty() {
+        "Cartella principale"
+    } else {
+        &selection.folder
+    }));
+    ui.set_selector_can_go_up(selection.folder != selection.root && !selection.selected_only);
+    ui.set_selector_selected_only(selection.selected_only);
     ui.set_has_selection(true);
     ui.set_selected_count(selected_count);
     ui.set_total_scanned(total);
@@ -212,7 +253,7 @@ fn sync_selector_ui_with_url(ui: &AppWindow, state: &AppState, current_url: &str
         "{selected_count} di {total} file · {}",
         format_size(selected_bytes)
     )));
-    ui.set_visible_files(ModelRc::new(VecModel::from(visible)));
+    ui.set_selector_entries(ModelRc::new(VecModel::from(visible)));
 }
 
 fn sync_selector_ui(ui: &AppWindow, state: &AppState) {
@@ -327,9 +368,12 @@ fn main() -> Result<(), slint::PlatformError> {
     ui.set_folder_text(SharedString::from(
         default_downloads_dir().to_string_lossy().as_ref(),
     ));
-    if let Some(cached_url) = load_cached_url() {
-        ui.set_url_text(SharedString::from(cached_url));
+    let cache_path = cache_file_path();
+    let initial_url = load_cached_url_from(&cache_path);
+    if let Some(url) = &initial_url {
+        ui.set_url_text(SharedString::from(url));
     }
+    let (last_link, link_writer) = start_link_writer(cache_path, initial_url, ui.as_weak());
 
     let state = Arc::new(Mutex::new(AppState::default()));
 
@@ -394,7 +438,7 @@ fn main() -> Result<(), slint::PlatformError> {
                             ui.set_status_detail(SharedString::from(
                                 "Sostituzione dell'eseguibile e riavvio automatico...",
                             ));
-                            std::process::exit(0);
+                            let _ = slint::quit_event_loop();
                         }
                         Err(err) => {
                             ui.set_status_title(SharedString::from("Aggiornamento non riuscito"));
@@ -422,32 +466,31 @@ fn main() -> Result<(), slint::PlatformError> {
         });
     }
 
-    // Paste link from clipboard (or restore cached link if clipboard is empty)
+    // Invalid clipboard content never overwrites the last usable link.
     {
         let ui_weak = ui.as_weak();
         let state = state.clone();
+        let last_link = last_link.clone();
         ui.on_paste_url(move || {
             let Some(ui) = ui_weak.upgrade() else { return };
             let pasted = arboard::Clipboard::new()
                 .ok()
-                .and_then(|mut clipboard| clipboard.get_text().ok())
-                .map(|text| text.trim().to_owned())
-                .filter(|text| !text.is_empty());
-
-            if let Some(trimmed) = pasted {
-                ui.set_url_text(SharedString::from(&trimmed));
-                ui.set_url_error(SharedString::default());
-                ui.set_banner_error(SharedString::default());
-                save_cached_url(&trimmed);
-                invalidate_selection_if_url_changed(&ui, &state, &trimmed);
-            } else if ui.get_url_text().as_str().trim().is_empty() {
-                if let Some(cached) = load_cached_url() {
-                    ui.set_url_text(SharedString::from(&cached));
-                    ui.set_url_error(SharedString::default());
-                    ui.set_banner_error(SharedString::default());
-                    invalidate_selection_if_url_changed(&ui, &state, &cached);
-                }
+                .and_then(|mut clipboard| clipboard.get_text().ok());
+            let Some(pasted) = pasted else {
+                ui.set_url_error(SharedString::from("Copia un link MediaFire negli appunti."));
+                return;
+            };
+            let url = pasted.trim();
+            if let Err(err) = download::parse_key(url) {
+                ui.set_url_error(SharedString::from(err));
+                return;
             }
+
+            ui.set_url_text(SharedString::from(url));
+            ui.set_url_error(SharedString::default());
+            ui.set_banner_error(SharedString::default());
+            last_link.remember(url);
+            invalidate_selection_if_url_changed(&ui, &state, url);
         });
     }
 
@@ -463,19 +506,16 @@ fn main() -> Result<(), slint::PlatformError> {
         });
     }
 
-    // Track URL edits to update selection visibility and cache valid MediaFire links
+    // This also receives Ctrl+V and pastes from the text field's context menu.
     {
         let ui_weak = ui.as_weak();
         let state = state.clone();
+        let last_link = last_link.clone();
         ui.on_url_edited(move |txt| {
             let Some(ui) = ui_weak.upgrade() else { return };
             ui.set_url_error(SharedString::default());
-            let raw = txt.to_string();
-            let trimmed = raw.trim();
-            if download::parse_key(trimmed).is_ok() {
-                save_cached_url(trimmed);
-            }
-            invalidate_selection_if_url_changed(&ui, &state, &raw);
+            last_link.remember(txt.as_str());
+            invalidate_selection_if_url_changed(&ui, &state, txt.as_str());
         });
     }
 
@@ -554,7 +594,6 @@ fn main() -> Result<(), slint::PlatformError> {
                 ui.set_url_error(SharedString::from(err));
                 return;
             }
-            save_cached_url(&url);
 
             // If already scanned for this exact URL, open the selector immediately.
             if let Ok(guard) = state.lock() {
@@ -634,73 +673,35 @@ fn main() -> Result<(), slint::PlatformError> {
     {
         let ui_weak = ui.as_weak();
         let state = state.clone();
-        ui.on_toggle_file(move |id| {
+        ui.on_manage_selector(move |action, id, path| {
             let Some(ui) = ui_weak.upgrade() else { return };
-            if let Ok(mut guard) = state.lock() {
-                if let Some(cache) = guard.scanned.as_mut() {
-                    if let Ok(idx) = usize::try_from(id) {
-                        if let Some(item) = cache.items.get_mut(idx) {
-                            item.checked = !item.checked;
-                        }
-                    }
-                }
-                sync_selector_ui(&ui, &guard);
-            }
-        });
-    }
-
-    {
-        let ui_weak = ui.as_weak();
-        let state = state.clone();
-        ui.on_toggle_sort_by_name(move || {
-            let Some(ui) = ui_weak.upgrade() else { return };
-            if let Ok(mut guard) = state.lock() {
+            let Ok(mut guard) = state.lock() else { return };
+            if action == SelectorAction::ToggleSort {
                 guard.sort_name_asc = !guard.sort_name_asc;
-                let asc = guard.sort_name_asc;
-                ui.set_sort_name_asc(asc);
-                if let Some(cache) = guard.scanned.as_mut() {
-                    sort_selectable_files(&mut cache.items, asc);
-                }
-                sync_selector_ui(&ui, &guard);
+                ui.set_sort_name_asc(guard.sort_name_asc);
             }
-        });
-    }
-
-    {
-        let ui_weak = ui.as_weak();
-        let state = state.clone();
-        ui.on_select_all_visible(move || {
-            let Some(ui) = ui_weak.upgrade() else { return };
-            let filter_lower = ui.get_filter_text().to_string().trim().to_lowercase();
-            if let Ok(mut guard) = state.lock() {
-                if let Some(cache) = guard.scanned.as_mut() {
-                    for item in &mut cache.items {
-                        if item_matches_filter(item, &filter_lower) {
-                            item.checked = true;
-                        }
+            let Some(cache) = guard.scanned.as_mut() else {
+                return;
+            };
+            let selection = &mut cache.selection;
+            match action {
+                SelectorAction::ToggleRow => {
+                    if let Ok(index) = usize::try_from(id) {
+                        selection.toggle_file(index);
+                    } else {
+                        selection.toggle_folder(path.as_str());
                     }
                 }
-                sync_selector_ui(&ui, &guard);
-            }
-        });
-    }
-
-    {
-        let ui_weak = ui.as_weak();
-        let state = state.clone();
-        ui.on_deselect_all_visible(move || {
-            let Some(ui) = ui_weak.upgrade() else { return };
-            let filter_lower = ui.get_filter_text().to_string().trim().to_lowercase();
-            if let Ok(mut guard) = state.lock() {
-                if let Some(cache) = guard.scanned.as_mut() {
-                    for item in &mut cache.items {
-                        if item_matches_filter(item, &filter_lower) {
-                            item.checked = false;
-                        }
-                    }
+                SelectorAction::OpenFolder => selection.open_folder(path.to_string()),
+                SelectorAction::GoUp => selection.go_up(),
+                SelectorAction::ToggleSelectedOnly => {
+                    selection.selected_only = !selection.selected_only
                 }
-                sync_selector_ui(&ui, &guard);
+                SelectorAction::SelectVisible => selection.set_visible(&filter(&ui), true),
+                SelectorAction::DeselectVisible => selection.set_visible(&filter(&ui), false),
+                SelectorAction::ToggleSort => {}
             }
+            sync_selector_ui(&ui, &guard);
         });
     }
 
@@ -744,7 +745,11 @@ fn main() -> Result<(), slint::PlatformError> {
         });
     }
 
-    ui.run()
+    let result = ui.run();
+    drop(ui);
+    drop(last_link);
+    let _ = link_writer.join();
+    result
 }
 
 fn trigger_download(ui: &AppWindow, state: &Arc<Mutex<AppState>>) {
@@ -767,7 +772,6 @@ fn trigger_download(ui: &AppWindow, state: &Arc<Mutex<AppState>>) {
         ui.set_url_error(SharedString::from(err));
         return;
     }
-    save_cached_url(&url);
 
     let output = PathBuf::from(&folder_str);
     if !output.is_dir() {
@@ -783,6 +787,7 @@ fn trigger_download(ui: &AppWindow, state: &Arc<Mutex<AppState>>) {
         guard.and_then(|g| {
             g.scanned.as_ref().filter(|c| c.url == url).map(|c| {
                 let jobs: Vec<_> = c
+                    .selection
                     .items
                     .iter()
                     .filter(|i| i.checked)
@@ -862,21 +867,13 @@ fn handle_update(
         }
         Update::ScanReady { key, files } => {
             let total = files.len();
-            let mut items: Vec<SelectableFile> = files
+            let items = files
                 .into_iter()
                 .map(|scanned| {
-                    let (name, rel_folder) = split_rel_path(&scanned.rel_path);
-                    let size_text = format_size(scanned.job.size);
-                    SelectableFile {
-                        scanned,
-                        name,
-                        rel_folder,
-                        size_text,
-                        checked: true,
-                    }
+                    let path = scanned.rel_path.clone();
+                    SelectableFile::new(scanned, path)
                 })
                 .collect();
-            sort_selectable_files(&mut items, true);
 
             ui.set_is_running(false);
             ui.set_is_indeterminate(false);
@@ -892,7 +889,7 @@ fn handle_update(
                 cur.scanned = Some(ScannedCache {
                     url: scanned_url.unwrap_or_default().to_owned(),
                     key,
-                    items,
+                    selection: Selection::new(items),
                 });
                 sync_selector_ui(ui, &cur);
             }
@@ -1027,59 +1024,6 @@ fn handle_update(
 mod tests {
     use super::*;
 
-    fn test_item(name: &str, rel_folder: &str, checked: bool) -> SelectableFile<()> {
-        SelectableFile {
-            scanned: (),
-            name: name.to_owned(),
-            rel_folder: rel_folder.to_owned(),
-            size_text: "1 KiB".to_owned(),
-            checked,
-        }
-    }
-
-    #[test]
-    fn sorts_selectable_files_az_and_za_preserving_checked_state() {
-        let mut items = vec![
-            test_item("part10.zip", "", false),
-            test_item("Beta.txt", "sub", true),
-            test_item("part2.zip", "", true),
-            test_item("alpha.txt", "z_dir", false),
-            test_item("alpha.txt", "a_dir", true),
-        ];
-
-        sort_selectable_files(&mut items, true);
-        let asc_view: Vec<(&str, &str, bool)> = items
-            .iter()
-            .map(|i| (i.name.as_str(), i.rel_folder.as_str(), i.checked))
-            .collect();
-        assert_eq!(
-            asc_view,
-            vec![
-                ("alpha.txt", "a_dir", true),
-                ("alpha.txt", "z_dir", false),
-                ("Beta.txt", "sub", true),
-                ("part2.zip", "", true),
-                ("part10.zip", "", false),
-            ]
-        );
-
-        sort_selectable_files(&mut items, false);
-        let desc_view: Vec<(&str, &str, bool)> = items
-            .iter()
-            .map(|i| (i.name.as_str(), i.rel_folder.as_str(), i.checked))
-            .collect();
-        assert_eq!(
-            desc_view,
-            vec![
-                ("part10.zip", "", false),
-                ("part2.zip", "", true),
-                ("Beta.txt", "sub", true),
-                ("alpha.txt", "z_dir", false),
-                ("alpha.txt", "a_dir", true),
-            ]
-        );
-    }
-
     #[test]
     fn persistent_cache_roundtrip_and_ignores_empty() {
         let dir =
@@ -1089,15 +1033,16 @@ mod tests {
 
         assert_eq!(load_cached_url_from(&path), None);
 
-        save_cached_url_to(&path, "   ");
+        save_cached_url_to(&path, "   ").unwrap();
         assert!(!path.exists());
 
         let url = "https://www.mediafire.com/folder/r1xp6x0i043wx/Test";
-        save_cached_url_to(&path, &format!("  {url}  "));
+        save_cached_url_to(&path, &format!("  {url}  ")).unwrap();
         assert_eq!(load_cached_url_from(&path), Some(url.to_owned()));
 
         let url2 = "https://www.mediafire.com/file/abc123/example.zip";
-        save_cached_url_to(&path, url2);
+        save_cached_url_to(&path, url2).unwrap();
+        save_cached_url_to(&path, "Clipboard non valido").unwrap();
         assert_eq!(load_cached_url_from(&path), Some(url2.to_owned()));
 
         let _ = std::fs::remove_dir_all(&dir);
