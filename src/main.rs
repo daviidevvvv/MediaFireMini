@@ -192,13 +192,16 @@ fn sync_selector_ui_with_url(ui: &AppWindow, state: &AppState, current_url: &str
         ui.set_selected_count(0);
         ui.set_total_scanned(0);
         ui.set_selection_summary(SharedString::default());
+        ui.set_selector_scope_summary(SharedString::default());
         ui.set_selector_entries(ModelRc::new(VecModel::from(Vec::<SelectorEntry>::new())));
         return;
     };
 
     let selection = &cache.selection;
-    let visible = selection
-        .rows(&filter(ui), state.sort_name_asc)
+    let active_filter = filter(ui);
+    let rows = selection.rows(&active_filter, state.sort_name_asc);
+    let scoped_selected_count: usize = rows.iter().map(|row| row.selected).sum();
+    let visible = rows
         .into_iter()
         .map(|row| {
             let (id, detail, size_text) = match row.file_index {
@@ -216,7 +219,16 @@ fn sync_selector_ui_with_url(ui: &AppWindow, state: &AppState, current_url: &str
                 ),
                 None => (
                     -1,
-                    format!("Cartella · {} di {} file", row.selected, row.total),
+                    format!(
+                        "Cartella · {} di {} {}",
+                        row.selected,
+                        row.total,
+                        if active_filter.is_empty() {
+                            "file"
+                        } else {
+                            "file corrispondenti"
+                        }
+                    ),
                     String::new(),
                 ),
             };
@@ -232,9 +244,7 @@ fn sync_selector_ui_with_url(ui: &AppWindow, state: &AppState, current_url: &str
         })
         .collect::<Vec<_>>();
     let (selected_count, selected_bytes) = selection
-        .items
-        .iter()
-        .filter(|item| item.checked)
+        .selected_items()
         .fold((0i32, 0u64), |(count, bytes), item| {
             (count + 1, bytes.saturating_add(item.scanned.job.size))
         });
@@ -252,6 +262,15 @@ fn sync_selector_ui_with_url(ui: &AppWindow, state: &AppState, current_url: &str
     ui.set_selection_summary(SharedString::from(format!(
         "{selected_count} di {total} file · {}",
         format_size(selected_bytes)
+    )));
+    let outside_scope = (selected_count as usize).saturating_sub(scoped_selected_count);
+    let scope = if selection.selected_only {
+        "Vista globale dei selezionati"
+    } else {
+        "Azioni sui risultati, anche nelle sottocartelle"
+    };
+    ui.set_selector_scope_summary(SharedString::from(format!(
+        "{scope} · {outside_scope} selezionati fuori ambito"
     )));
     ui.set_selector_entries(ModelRc::new(VecModel::from(visible)));
 }
@@ -684,21 +703,24 @@ fn main() -> Result<(), slint::PlatformError> {
                 return;
             };
             let selection = &mut cache.selection;
+            let active_filter = filter(&ui);
             match action {
                 SelectorAction::ToggleRow => {
                     if let Ok(index) = usize::try_from(id) {
                         selection.toggle_file(index);
                     } else {
-                        selection.toggle_folder(path.as_str());
+                        selection.toggle_folder(path.as_str(), &active_filter);
                     }
                 }
                 SelectorAction::OpenFolder => selection.open_folder(path.to_string()),
                 SelectorAction::GoUp => selection.go_up(),
                 SelectorAction::ToggleSelectedOnly => {
-                    selection.selected_only = !selection.selected_only
+                    let current_filter = ui.get_filter_text();
+                    let next_filter = selection.toggle_selected_only(current_filter.as_str());
+                    ui.set_filter_text(SharedString::from(next_filter));
                 }
-                SelectorAction::SelectVisible => selection.set_visible(&filter(&ui), true),
-                SelectorAction::DeselectVisible => selection.set_visible(&filter(&ui), false),
+                SelectorAction::SelectVisible => selection.set_visible(&active_filter, true),
+                SelectorAction::DeselectVisible => selection.set_visible(&active_filter, false),
                 SelectorAction::ToggleSort => {}
             }
             sync_selector_ui(&ui, &guard);
@@ -783,25 +805,26 @@ fn trigger_download(ui: &AppWindow, state: &Arc<Mutex<AppState>>) {
 
     // Use pre-scanned selection if available for this exact URL.
     let selected_jobs = {
-        let guard = state.lock().ok();
-        guard.and_then(|g| {
-            g.scanned.as_ref().filter(|c| c.url == url).map(|c| {
-                let jobs: Vec<_> = c
-                    .selection
-                    .items
-                    .iter()
-                    .filter(|i| i.checked)
-                    .map(|i| i.scanned.job.clone())
-                    .collect();
-                (c.key.clone(), jobs)
-            })
+        let Ok(guard) = state.lock() else {
+            ui.set_banner_error(SharedString::from(
+                "Impossibile leggere la selezione. Download non avviato.",
+            ));
+            return;
+        };
+        guard.scanned.as_ref().filter(|c| c.url == url).map(|c| {
+            let jobs: Vec<_> = c
+                .selection
+                .selected_items()
+                .map(|i| i.scanned.job.clone())
+                .collect();
+            (c.key.clone(), jobs)
         })
     };
 
     if let Some((_, ref jobs)) = selected_jobs {
         if jobs.is_empty() {
             ui.set_banner_error(SharedString::from(
-                "Nessun file selezionato. Scegli almeno un file oppure clicca 'Scarica tutti'.",
+                "Nessun file selezionato. Scegli almeno un file oppure clicca 'Ripristina tutti'.",
             ));
             return;
         }

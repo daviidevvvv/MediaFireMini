@@ -89,6 +89,7 @@ export component AppWindow inherits MaterialWindow {
     in property <int> selected_count: 0;
     in property <int> total_scanned: 0;
     in property <string> selection_summary: "";
+    in property <string> selector_scope_summary: "";
 
     callback paste_url();
     callback clear_url();
@@ -388,7 +389,8 @@ export component AppWindow inherits MaterialWindow {
                         }
 
                         TextButton {
-                            text: "Scarica tutti";
+                            text: "Ripristina tutti";
+                            accessible-description: "Il prossimo download includerà tutti i file del link.";
                             enabled: !root.is_running;
                             clicked => { root.reset_selection(); }
                         }
@@ -565,14 +567,14 @@ export component AppWindow inherits MaterialWindow {
                 }
 
                 MaterialText {
-                    text: root.selection_summary;
+                    text: "Totale selezionato: " + root.selection_summary;
                     style: MaterialTypography.body_small;
                     color: MaterialPalette.primary;
                 }
             }
 
             TonalButton {
-                text: root.selector_selected_only ? "Tutte le cartelle" : "Solo selezionati";
+                text: root.selector_selected_only ? "Torna alle cartelle" : "Solo selezionati";
                 enabled: root.selector_selected_only || root.selected_count > 0;
                 clicked => {
                     root.manage_selector(SelectorAction.toggle-selected-only, -1, "");
@@ -593,6 +595,13 @@ export component AppWindow inherits MaterialWindow {
             }
         }
 
+        MaterialText {
+            vertical-stretch: 0;
+            text: root.selector_scope_summary;
+            style: MaterialTypography.body_small;
+            color: MaterialPalette.on_surface_variant;
+        }
+
         // Select All / Deselect All & Sort Toolbar
         HorizontalLayout {
             spacing: MaterialStyleMetrics.spacing_8;
@@ -600,14 +609,14 @@ export component AppWindow inherits MaterialWindow {
 
             OutlineButton {
                 horizontal-stretch: 0;
-                text: "Seleziona tutto";
+                text: "Seleziona risultati";
                 enabled: !root.selector_selected_only && root.selector_entries.length > 0;
                 clicked => { root.manage_selector(SelectorAction.select-visible, -1, ""); }
             }
 
             OutlineButton {
                 horizontal-stretch: 0;
-                text: "Deseleziona tutto";
+                text: "Deseleziona risultati";
                 enabled: root.selector_entries.length > 0;
                 clicked => { root.manage_selector(SelectorAction.deselect-visible, -1, ""); }
             }
@@ -769,6 +778,7 @@ export component AppWindow inherits MaterialWindow {
             FilledButton {
                 horizontal-stretch: 1;
                 text: "Scarica selezionati (" + root.selected_count + ")";
+                accessible-description: "Scarica tutti i file selezionati, anche fuori dalla vista corrente.";
                 enabled: root.selected_count > 0 && !root.is_running;
                 clicked => { root.start_selected_download(); }
             }

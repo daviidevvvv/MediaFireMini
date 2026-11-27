@@ -1,6 +1,6 @@
 [package]
 name = "mediafire_mini"
-version = "0.3.4"
+version = "0.3.5"
 edition = "2021"
 description = "Standalone Windows Material 3 GUI (Slint) for MediaFire folder & file downloads"
 build = "build.rs"
